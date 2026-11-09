@@ -1,0 +1,660 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>台鐵列車即時追蹤地圖</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root{
+    --bg:#0c1118; --panel:#141b26; --panel2:#1b2432; --line:#2a3545;
+    --fg:#e8edf4; --fg-dim:#8fa0b5; --accent:#ff7a1a; --accent2:#ffb347;
+    --ok:#3ecf8e; --warn:#ffcc4d; --err:#ff5d5d; --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang TC","Noto Sans TC",sans-serif;}
+  body{display:flex;flex-direction:column;}
+  header{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;background:var(--panel);}
+  header h1{font-size:17px;margin:0;letter-spacing:.3px;}
+  header h1 b{color:var(--accent);font-weight:800;}
+  header .sub{font-size:12px;color:var(--fg-dim);}
+  #layout{flex:1;display:flex;min-height:0;}
+  #sidebar{width:360px;min-width:300px;max-width:420px;border-right:1px solid var(--line);
+    background:var(--panel);display:flex;flex-direction:column;overflow:auto;}
+  #map{flex:1;min-width:0;background:#0a0e14;}
+  .section{padding:14px 16px;border-bottom:1px solid var(--line);}
+  .section h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--fg-dim);margin:0 0 10px;
+    display:flex;align-items:center;justify-content:space-between;gap:8px;}
+  .section h2 .cap{font-weight:400;text-transform:none;letter-spacing:0;color:#50607a;font-size:11px;}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:7px;}
+  .row label{width:58px;flex:none;font-size:12px;color:var(--fg-dim);font-family:var(--mono);}
+  input[type=text],input[type=password]{
+    flex:1;min-width:0;background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+    border-radius:7px;padding:7px 9px;font-size:13px;font-family:var(--mono);
+  }
+  input::placeholder{color:#50607a;}
+  input:focus{outline:none;border-color:var(--accent);}
+  .toggle-eye{flex:none;background:none;border:none;color:var(--fg-dim);cursor:pointer;font-size:13px;padding:4px;}
+  .rm-btn{flex:none;background:none;border:1px solid var(--line);color:var(--fg-dim);cursor:pointer;
+    font-size:13px;width:26px;height:26px;border-radius:6px;line-height:1;}
+  .rm-btn:hover{border-color:var(--err);color:var(--err);}
+  .add-row-btn{width:100%;background:var(--panel2);border:1px dashed var(--line);color:var(--accent2);
+    border-radius:8px;padding:8px;font-size:12px;cursor:pointer;margin-top:4px;font-weight:600;}
+  .add-row-btn:hover{border-color:var(--accent);}
+  .add-row-btn:disabled{opacity:.35;cursor:not-allowed;color:var(--fg-dim);}
+
+  /* one key = one card holding ClientId + ClientSecret together */
+  .keygroup{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+    padding:9px 10px 10px;margin-bottom:9px;border-left:3px solid #555;transition:border-color .2s;}
+  .keygroup.active{border-left-color:var(--ok);}
+  .keygroup.dead{border-left-color:var(--err);}
+  .keygroup-head{display:flex;align-items:center;gap:6px;margin-bottom:7px;}
+  .keygroup-head .idx{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--fg-dim);flex:1;}
+  .keygroup.active .keygroup-head .idx{color:var(--ok);}
+  .keygroup.dead .keygroup-head .idx{color:var(--err);}
+  .keygroup-head .tag{font-size:10px;font-family:var(--mono);padding:1px 6px;border-radius:4px;
+    background:#123;color:var(--ok);display:none;}
+  .keygroup.active .tag.active{display:inline-block;}
+  .keygroup.dead .tag.dead{display:inline-block;background:#3a1414;color:var(--err);}
+  .keygroup .row{margin-bottom:6px;}
+  .keygroup .row:last-child{margin-bottom:0;}
+
+  .btnrow{display:flex;gap:8px;margin-top:10px;}
+  button.main{flex:1;background:var(--accent);color:#1a0d00;border:none;border-radius:8px;
+    padding:10px;font-weight:700;font-size:13px;cursor:pointer;}
+  button.main.stop{background:var(--err);color:#200;}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg-dim);
+    border-radius:8px;padding:10px 12px;font-size:13px;cursor:pointer;}
+  button.main:active,button.ghost:active{transform:scale(.98);}
+  .hint{font-size:11px;color:var(--fg-dim);line-height:1.5;margin-top:8px;}
+  .hint code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-family:var(--mono);}
+  #status{flex:1;overflow:auto;}
+  .log{font-family:var(--mono);font-size:11px;color:var(--fg-dim);padding:3px 0;border-bottom:1px dashed #1e2733;}
+  .log .t{color:#50607a;margin-right:6px;}
+  .log.err{color:var(--err);}
+  .log.ok{color:var(--ok);}
+  #cards{display:flex;flex-direction:column;gap:10px;padding:12px 16px;}
+  .card{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;
+    border-left:4px solid var(--c,#555);}
+  .card .no{font-family:var(--mono);font-weight:800;font-size:15px;color:var(--c,#fff);}
+  .card .st{font-size:13px;margin-top:3px;}
+  .card .meta{font-size:11px;color:var(--fg-dim);margin-top:4px;font-family:var(--mono);}
+  .card .delay{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:5px;font-size:11px;font-family:var(--mono);}
+  .delay.ok{background:#123; color:var(--ok);}
+  .delay.late{background:#3a1a00;color:var(--warn);}
+  .pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--c,#999);
+    margin-right:6px;box-shadow:0 0 0 0 var(--c,#999);animation:pulse 1.6s infinite;}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb, var(--c,#999) 60%, transparent)}
+    70%{box-shadow:0 0 0 8px transparent}100%{box-shadow:0 0 0 0 transparent}}
+  .train-dot{border-radius:50%;border:2px solid #fff;box-shadow:0 0 6px rgba(0,0,0,.5);
+    display:flex;align-items:center;justify-content:center;color:#fff;font-family:var(--mono);
+    font-weight:800;font-size:10px;transition:left .9s linear, top .9s linear;}
+  .leaflet-container{background:#0a0e14;}
+  @media (max-width:760px){
+    #layout{flex-direction:column;}
+    #sidebar{width:100%;max-width:none;max-height:52vh;}
+    #map{min-height:48vh;}
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1><b>台鐵</b> 列車即時位置追蹤</h1>
+  <span class="sub">最多 5 班次 · TDX 開放資料 · 本機瀏覽器執行</span>
+</header>
+
+<div id="layout">
+  <div id="sidebar">
+
+    <div class="section">
+      <h2>追蹤車次 <span class="cap" id="trainCap">1 / 5</span></h2>
+      <div id="trainInputs"></div>
+      <button type="button" class="add-row-btn" id="addTrainBtn">＋ 新增車次</button>
+      <div class="hint">輸入台鐵車次號碼，例如 <code>123</code>、<code>1234</code>。</div>
+    </div>
+
+    <div class="section">
+      <h2>TDX API 金鑰 <span class="cap" id="keyCap">1 / 5</span></h2>
+      <div id="keyInputs"></div>
+      <button type="button" class="add-row-btn" id="addKeyBtn">＋ 新增一組金鑰</button>
+      <div class="hint">
+        每組請分別輸入 <code>Client Id</code> 與 <code>Client Secret</code>（TDX 會員中心「API金鑰」頁可取得）。
+        系統會從第 1 組開始取得授權，若該組失效（401/403）會自動換下一組，直到成功或全部失敗為止。
+        金鑰僅儲存在你本機瀏覽器（localStorage），不會上傳到任何第三方。
+      </div>
+      <div class="btnrow">
+        <button class="main" id="startBtn">開始追蹤</button>
+        <button class="ghost" id="clearBtn">清除紀錄</button>
+      </div>
+    </div>
+
+    <div class="section" id="cardsSection" style="display:none;">
+      <h2>車次狀態</h2>
+      <div id="cards"></div>
+    </div>
+
+    <div class="section" style="flex:1;display:flex;flex-direction:column;min-height:120px;">
+      <h2>系統紀錄</h2>
+      <div id="status"></div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function(){
+  "use strict";
+
+  // ---------- constants ----------
+  var AUTH_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token";
+  var BASE = "https://tdx.transportdata.tw/api/basic";
+  var STATION_URL = BASE + "/v2/Rail/TRA/Station?$format=JSON";
+  // Candidate live-position endpoints, tried in order per train until one works.
+  // TDX's live train-position dataset has been served under a couple of different
+  // path/version spellings over time, so we probe them instead of hardcoding one.
+  function liveCandidates(trainNo){
+    var n = encodeURIComponent(trainNo);
+    return [
+      BASE + "/v2/Rail/TRA/TrainLiveBoard/TrainNo/" + n + "?$format=JSON",
+      BASE + "/v2/Rail/TRA/TrainLiveBoard?$filter=TrainNo%20eq%20'" + n + "'&$format=JSON",
+      BASE + "/v3/Rail/TRA/TrainLiveBoard?$filter=TrainNo%20eq%20'" + n + "'&$format=JSON",
+      BASE + "/v2/Rail/TRA/LiveBoard?$filter=TrainNo%20eq%20'" + n + "'&$format=JSON"
+    ];
+  }
+  var COLORS = ["#ff7a1a","#3ecf8e","#4da6ff","#ff5d9e","#ffd23f"];
+  var POLL_MS = 25000;
+  var MAX_TRAINS = 5;
+  var MAX_KEYS = 5;
+
+  // ---------- state ----------
+  var keyWorkingIndex = 0;      // which key slot currently works, by DOM position
+  var token = null, tokenExpiry = 0;
+  var stationById = {};         // StationID -> {name, lat, lon}
+  var liveEndpointWinner = {};  // trainNo -> url template index that worked last time
+  var trainState = {};          // trainNo -> {stationId, nextStationId, delay, updateTime, marker, ...}
+  var pollTimer = null;
+  var running = false;
+  var rowSeq = 0;                // unique id generator for dynamically added rows
+
+  // ---------- small utils ----------
+  function $(id){ return document.getElementById(id); }
+  function nowStr(){
+    var d = new Date();
+    return d.toTimeString().slice(0,8);
+  }
+  function log(msg, cls){
+    var el = document.createElement("div");
+    el.className = "log" + (cls ? " " + cls : "");
+    el.innerHTML = '<span class="t">'+nowStr()+'</span>' + msg;
+    var box = $("status");
+    box.insertBefore(el, box.firstChild);
+    while(box.children.length > 120) box.removeChild(box.lastChild);
+  }
+  function pick(obj, candidates){
+    if(!obj) return undefined;
+    for(var i=0;i<candidates.length;i++){
+      if(obj[candidates[i]] !== undefined && obj[candidates[i]] !== null) return obj[candidates[i]];
+    }
+    var keys = Object.keys(obj);
+    for(var c=0;c<candidates.length;c++){
+      var cand = candidates[c].toLowerCase();
+      for(var k=0;k<keys.length;k++){
+        if(keys[k].toLowerCase() === cand) return obj[keys[k]];
+      }
+    }
+    return undefined;
+  }
+  function zh(nameObj){
+    if(!nameObj) return "";
+    if(typeof nameObj === "string") return nameObj;
+    return nameObj.Zh_tw || nameObj.Zh_Tw || nameObj.zh_tw || nameObj.En || "";
+  }
+  function esc(s){
+    return String(s==null?"":s).replace(/"/g,"&quot;");
+  }
+
+  // ---------- dynamic train rows ----------
+  function trainRows(){ return Array.prototype.slice.call(document.querySelectorAll("#trainInputs .row")); }
+
+  function renumberTrains(){
+    var rows = trainRows();
+    rows.forEach(function(row, i){
+      row.querySelector("label").textContent = "車次 " + (i+1);
+    });
+    $("trainCap").textContent = rows.length + " / " + MAX_TRAINS;
+    $("addTrainBtn").disabled = rows.length >= MAX_TRAINS;
+  }
+
+  function addTrainRow(value){
+    if(trainRows().length >= MAX_TRAINS) return;
+    rowSeq++;
+    var row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML =
+      '<label>車次</label>' +
+      '<input type="text" class="train-input" placeholder="例如 123" inputmode="numeric" value="'+esc(value)+'">' +
+      '<button type="button" class="rm-btn" title="移除">×</button>';
+    row.querySelector(".rm-btn").addEventListener("click", function(){
+      row.remove();
+      renumberTrains();
+    });
+    $("trainInputs").appendChild(row);
+    renumberTrains();
+  }
+
+  $("addTrainBtn").addEventListener("click", function(){ addTrainRow(""); });
+
+  // ---------- dynamic key groups (ClientId + ClientSecret together) ----------
+  function keyGroups(){ return Array.prototype.slice.call(document.querySelectorAll("#keyInputs .keygroup")); }
+
+  function renumberKeys(){
+    var groups = keyGroups();
+    groups.forEach(function(g, i){
+      g.querySelector(".idx").textContent = "金鑰 " + (i+1);
+    });
+    $("keyCap").textContent = groups.length + " / " + MAX_KEYS;
+    $("addKeyBtn").disabled = groups.length >= MAX_KEYS;
+  }
+
+  function addKeyGroup(idVal, secretVal){
+    if(keyGroups().length >= MAX_KEYS) return;
+    rowSeq++;
+    var g = document.createElement("div");
+    g.className = "keygroup";
+    g.innerHTML =
+      '<div class="keygroup-head">' +
+        '<span class="idx">金鑰</span>' +
+        '<span class="tag active">使用中</span>' +
+        '<span class="tag dead">已失效</span>' +
+        '<button type="button" class="rm-btn" title="移除">×</button>' +
+      '</div>' +
+      '<div class="row"><label>Client Id</label>' +
+        '<input type="text" class="key-id" placeholder="Client Id" value="'+esc(idVal)+'"></div>' +
+      '<div class="row"><label>Secret</label>' +
+        '<input type="password" class="key-secret" placeholder="Client Secret" value="'+esc(secretVal)+'">' +
+        '<button type="button" class="toggle-eye">👁</button></div>';
+    g.querySelector(".rm-btn").addEventListener("click", function(){
+      g.remove();
+      renumberKeys();
+    });
+    g.querySelector(".toggle-eye").addEventListener("click", function(){
+      var inp = g.querySelector(".key-secret");
+      inp.type = inp.type === "password" ? "text" : "password";
+    });
+    $("keyInputs").appendChild(g);
+    renumberKeys();
+  }
+
+  $("addKeyBtn").addEventListener("click", function(){ addKeyGroup("",""); });
+
+  // ---------- local persistence (convenience only) ----------
+  function loadSaved(){
+    try{
+      var t = JSON.parse(localStorage.getItem("tra_tracker_trains") || "[]");
+      var k = JSON.parse(localStorage.getItem("tra_tracker_keys") || "[]");
+      return {trains:t, keys:k};
+    }catch(e){ return {trains:[], keys:[]}; }
+  }
+  function saveState(){
+    try{
+      var trains = trainRows().map(function(r){ return r.querySelector(".train-input").value.trim(); });
+      var keys = keyGroups().map(function(g){
+        return {id: g.querySelector(".key-id").value.trim(), secret: g.querySelector(".key-secret").value.trim()};
+      });
+      localStorage.setItem("tra_tracker_trains", JSON.stringify(trains));
+      localStorage.setItem("tra_tracker_keys", JSON.stringify(keys));
+    }catch(e){}
+  }
+
+  // ---------- build initial rows ----------
+  (function buildInputs(){
+    var saved = loadSaved();
+    if(saved.trains.length){
+      saved.trains.slice(0, MAX_TRAINS).forEach(function(v){ addTrainRow(v); });
+    } else {
+      addTrainRow("");
+    }
+    if(saved.keys.length){
+      saved.keys.slice(0, MAX_KEYS).forEach(function(k){ addKeyGroup(k.id||"", k.secret||""); });
+    } else {
+      addKeyGroup("","");
+    }
+  })();
+
+  // ---------- map ----------
+  var map = L.map("map", {zoomControl:true}).setView([23.6, 121.0], 7);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 18,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+  var glideLines = {}; // trainNo -> polyline
+
+  function ensureMarker(trainNo, color){
+    if(trainState[trainNo].marker) return trainState[trainNo].marker;
+    var icon = L.divIcon({
+      className: "",
+      html: '<div class="train-dot" style="width:26px;height:26px;background:'+color+';position:relative;">'+trainNo+'</div>',
+      iconSize: [26,26], iconAnchor:[13,13]
+    });
+    var m = L.marker([23.6,121.0], {icon: icon}).addTo(map);
+    trainState[trainNo].marker = m;
+    return m;
+  }
+
+  function animateMarkerTo(marker, fromLatLng, toLatLng, ms){
+    var start = performance.now();
+    function step(ts){
+      var p = Math.min(1, (ts-start)/ms);
+      var lat = fromLatLng[0] + (toLatLng[0]-fromLatLng[0])*p;
+      var lon = fromLatLng[1] + (toLatLng[1]-fromLatLng[1])*p;
+      marker.setLatLng([lat, lon]);
+      if(p < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+
+  // ---------- TDX auth ----------
+  function getActiveKeys(){
+    // returns array aligned 1:1 with keyGroups() DOM order; null where a group is incomplete
+    return keyGroups().map(function(g){
+      var id = g.querySelector(".key-id").value.trim();
+      var secret = g.querySelector(".key-secret").value.trim();
+      if(!id || !secret) return null;
+      return {id:id, secret:secret};
+    });
+  }
+
+  function markBadge(i, state){
+    var groups = keyGroups();
+    groups.forEach(function(g, j){
+      g.classList.remove("active","dead");
+      if(j === i && state === "active") g.classList.add("active");
+      if(j === i && state === "dead") g.classList.add("dead");
+    });
+  }
+
+  function authWithKey(keyObj){
+    var body = "grant_type=client_credentials&client_id=" + encodeURIComponent(keyObj.id) +
+               "&client_secret=" + encodeURIComponent(keyObj.secret);
+    return fetch(AUTH_URL, {
+      method: "POST",
+      headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      body: body
+    }).then(function(res){
+      if(!res.ok){
+        return res.text().then(function(txt){
+          var detail = "HTTP " + res.status;
+          try{
+            var j = JSON.parse(txt);
+            if(j.error) detail = j.error + (j.error_description ? ": " + j.error_description : "");
+          }catch(e){
+            if(txt) detail += " " + txt.slice(0,120);
+          }
+          throw new Error(detail);
+        });
+      }
+      return res.json();
+    });
+  }
+
+  // Try keys starting at keyWorkingIndex, rolling forward through all groups on failure.
+  function getToken(){
+    if(token && Date.now() < tokenExpiry - 60000){
+      return Promise.resolve(token);
+    }
+    var keys = getActiveKeys();
+    var total = keys.length;
+    var startAt = Math.min(keyWorkingIndex, Math.max(total-1,0));
+    function attempt(offset){
+      if(offset >= total){
+        return Promise.reject(new Error("所有 " + total + " 組 TDX 金鑰都無法授權，請檢查金鑰內容。"));
+      }
+      var i = (startAt + offset) % total;
+      var k = keys[i];
+      if(!k){
+        return attempt(offset+1);
+      }
+      return authWithKey(k).then(function(data){
+        token = data.access_token;
+        tokenExpiry = Date.now() + (data.expires_in ? data.expires_in*1000 : 3600000);
+        keyWorkingIndex = i;
+        markBadge(i, "active");
+        log("使用金鑰 " + (i+1) + " 取得授權成功。", "ok");
+        return token;
+      }).catch(function(err){
+        markBadge(i, "dead");
+        log("金鑰 " + (i+1) + " 授權失敗（" + err.message + "），改用下一組。", "err");
+        return attempt(offset+1);
+      });
+    }
+    if(total === 0){
+      return Promise.reject(new Error("尚未輸入任何金鑰。"));
+    }
+    return attempt(0);
+  }
+
+  function authedFetch(url){
+    return getToken().then(function(tok){
+      return fetch(url, {headers: {"Authorization": "Bearer " + tok}});
+    }).then(function(res){
+      if(res.status === 401 || res.status === 403){
+        // current key just got rejected on a data call — rotate and retry once
+        var total = getActiveKeys().length || 1;
+        token = null;
+        keyWorkingIndex = (keyWorkingIndex + 1) % total;
+        log("目前金鑰於資料查詢被拒，切換下一組重試。", "err");
+        return getToken().then(function(tok2){
+          return fetch(url, {headers:{"Authorization":"Bearer "+tok2}});
+        });
+      }
+      return res;
+    });
+  }
+
+  // ---------- station static data ----------
+  function loadStations(){
+    log("載入台鐵車站座標資料…");
+    return authedFetch(STATION_URL).then(function(res){
+      if(!res.ok) throw new Error("station_http_" + res.status);
+      return res.json();
+    }).then(function(arr){
+      if(!Array.isArray(arr)) throw new Error("station_bad_shape");
+      arr.forEach(function(s){
+        var id = pick(s, ["StationID"]);
+        var pos = pick(s, ["StationPosition"]) || {};
+        var lon = pick(pos, ["PositionLon"]);
+        var lat = pick(pos, ["PositionLat"]);
+        var name = zh(pick(s, ["StationName"]));
+        if(id && lat && lon){
+          stationById[String(id)] = {name:name, lat:parseFloat(lat), lon:parseFloat(lon)};
+        }
+      });
+      log("車站座標載入完成，共 " + Object.keys(stationById).length + " 站。", "ok");
+    }).catch(function(err){
+      log("車站資料載入失敗：" + err.message, "err");
+      throw err;
+    });
+  }
+
+  // ---------- live position polling ----------
+  function tryLiveEndpoints(trainNo){
+    var cands = liveCandidates(trainNo);
+    var preferred = liveEndpointWinner[trainNo];
+    var order = cands.map(function(_,i){return i;});
+    if(preferred !== undefined){
+      order = [preferred].concat(order.filter(function(i){return i!==preferred;}));
+    }
+    function attempt(k){
+      if(k >= order.length) return Promise.reject(new Error("no_endpoint_worked"));
+      var idx = order[k];
+      return authedFetch(cands[idx]).then(function(res){
+        if(!res.ok) return attempt(k+1);
+        return res.json().then(function(data){
+          var rows = Array.isArray(data) ? data : (data ? [data] : []);
+          if(rows.length === 0) return attempt(k+1);
+          liveEndpointWinner[trainNo] = idx;
+          return rows;
+        }).catch(function(){ return attempt(k+1); });
+      }).catch(function(){ return attempt(k+1); });
+    }
+    return attempt(0);
+  }
+
+  function parseRow(row){
+    return {
+      stationId: String(pick(row, ["StationID","TrainStationID","NowStationID"]) || ""),
+      stationName: zh(pick(row, ["StationName","TrainStationName","NowStationName"])),
+      nextStationId: String(pick(row, ["NextStationID"]) || ""),
+      endingStationId: String(pick(row, ["EndingStationID"]) || ""),
+      endingStationName: zh(pick(row, ["EndingStationName"])),
+      delay: pick(row, ["DelayTime","Delay"]) || 0,
+      updateTime: pick(row, ["UpdateTime","SrcUpdateTime"]) || "",
+      direction: pick(row, ["Direction"])
+    };
+  }
+
+  function pollOne(trainNo, color){
+    return tryLiveEndpoints(trainNo).then(function(rows){
+      rows.sort(function(a,b){
+        var ta = pick(a,["UpdateTime","SrcUpdateTime"]) || "";
+        var tb = pick(b,["UpdateTime","SrcUpdateTime"]) || "";
+        return tb.localeCompare(ta);
+      });
+      var info = parseRow(rows[0]);
+      updateTrainCard(trainNo, info, color, null);
+
+      var cur = stationById[info.stationId];
+      if(!cur){
+        log("車次 " + trainNo + "：目前站點座標查無資料（StationID=" + info.stationId + "）。", "err");
+        return;
+      }
+      var target = stationById[info.nextStationId] || null;
+      var marker = ensureMarker(trainNo, color);
+      var from = marker.getLatLng();
+      var fromArr = (from.lat === 0 && from.lng === 0) ? [cur.lat, cur.lon] : [from.lat, from.lng];
+
+      if(glideLines[trainNo]) map.removeLayer(glideLines[trainNo]);
+      if(target){
+        glideLines[trainNo] = L.polyline([[cur.lat,cur.lon],[target.lat,target.lon]], {
+          color: color, weight: 2, opacity: .5, dashArray: "4,6"
+        }).addTo(map);
+      }
+      animateMarkerTo(marker, fromArr, [cur.lat, cur.lon], 900);
+
+      trainState[trainNo].lastInfo = info;
+      trainState[trainNo].lastSeen = Date.now();
+      updateTrainCard(trainNo, info, color, cur);
+      log("車次 " + trainNo + " 更新：" + (cur.name||info.stationId) +
+          "，誤點 " + (info.delay||0) + " 分。", "ok");
+    }).catch(function(err){
+      log("車次 " + trainNo + " 查詢失敗：" + err.message, "err");
+      updateTrainCard(trainNo, null, color, null, true);
+    });
+  }
+
+  function updateTrainCard(trainNo, info, color, stationObj, failed){
+    var el = $("card_" + trainNo);
+    if(!el){
+      el = document.createElement("div");
+      el.className = "card";
+      el.id = "card_" + trainNo;
+      el.style.setProperty("--c", color);
+      $("cards").appendChild(el);
+    }
+    if(failed){
+      el.innerHTML = '<div class="no">車次 '+trainNo+'</div><div class="st" style="color:var(--err)">查詢失敗，稍後重試中…</div>';
+      return;
+    }
+    if(!info){
+      el.innerHTML = '<div class="no">車次 '+trainNo+'</div><div class="st">查詢中…</div>';
+      return;
+    }
+    var delayCls = (info.delay && info.delay > 0) ? "late" : "ok";
+    var delayTxt = (info.delay && info.delay > 0) ? ("誤點 " + info.delay + " 分") : "準點";
+    el.innerHTML =
+      '<div class="no"><span class="pulse" style="--c:'+color+'"></span>車次 '+trainNo+'</div>' +
+      '<div class="st">目前位置：'+ (info.stationName || stationObj && stationObj.name || info.stationId || "未知") +
+      '<span class="delay '+delayCls+'">'+delayTxt+'</span></div>' +
+      '<div class="meta">終點：'+(info.endingStationName||"—")+' ・ 更新時間：'+(info.updateTime||"—")+'</div>';
+  }
+
+  // ---------- polling loop ----------
+  function activeTrains(){
+    return trainRows().map(function(row, i){
+      var v = row.querySelector(".train-input").value.trim();
+      return v ? {no:v, color: COLORS[i % COLORS.length]} : null;
+    }).filter(Boolean);
+  }
+
+  function pollAll(){
+    var trains = activeTrains();
+    trains.forEach(function(t){
+      if(!trainState[t.no]) trainState[t.no] = {};
+      pollOne(t.no, t.color);
+    });
+    if(trains.length){
+      var bounds = [];
+      trains.forEach(function(t){
+        if(trainState[t.no] && trainState[t.no].marker){
+          bounds.push(trainState[t.no].marker.getLatLng());
+        }
+      });
+      if(bounds.length) map.fitBounds(bounds, {padding:[60,60], maxZoom: 12});
+    }
+  }
+
+  function start(){
+    var trains = activeTrains();
+    if(trains.length === 0){
+      log("請至少輸入一個車次再開始追蹤。", "err");
+      return;
+    }
+    if(getActiveKeys().every(function(k){return !k;})){
+      log("請至少輸入一組完整的 TDX 金鑰（Client Id + Client Secret）。", "err");
+      return;
+    }
+    saveState();
+    $("cardsSection").style.display = "block";
+    $("cards").innerHTML = "";
+    trainState = {};
+    liveEndpointWinner = {};
+    running = true;
+    $("startBtn").textContent = "停止追蹤";
+    $("startBtn").classList.add("stop");
+    log("開始追蹤，每 " + Math.round(POLL_MS/1000) + " 秒更新一次。");
+
+    loadStations().then(function(){
+      pollAll();
+      pollTimer = setInterval(pollAll, POLL_MS);
+    }).catch(function(){
+      running = false;
+      $("startBtn").textContent = "開始追蹤";
+      $("startBtn").classList.remove("stop");
+    });
+  }
+
+  function stop(){
+    running = false;
+    if(pollTimer) clearInterval(pollTimer);
+    pollTimer = null;
+    $("startBtn").textContent = "開始追蹤";
+    $("startBtn").classList.remove("stop");
+    log("已停止追蹤。");
+  }
+
+  $("startBtn").addEventListener("click", function(){
+    if(running) stop(); else start();
+  });
+  $("clearBtn").addEventListener("click", function(){
+    $("status").innerHTML = "";
+  });
+
+  log("就緒。請輸入車次與 TDX 金鑰後按「開始追蹤」。");
+  log("提示：TDX 沒有逐秒 GPS，位置依官方即時到離站資料逐站更新，點位以平滑動畫過渡顯示移動感。", "");
+})();
+</script>
+</body>
+</html>
