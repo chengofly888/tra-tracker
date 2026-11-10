@@ -628,19 +628,20 @@
     var pad = function(n){ return n < 10 ? "0"+n : ""+n; };
     return d.getFullYear() + "-" + pad(d.getMonth()+1) + "-" + pad(d.getDate());
   }
-  // Deliberately just these two, single-train-number endpoints (no $filter,
-  // no generic/listing queries) to avoid OData filter-quoting mistakes and
-  // page-size truncation on a large unfiltered timetable dataset.
-  // NOTE: kept on the same host (tdx.transportdata.tw) as every other call
-  // in this page (auth, station list, live board) since that's the one
-  // confirmed to actually work here; a different TDX host would just fail
-  // outright (DNS/CORS), not a useful fallback.
+  // The endpoint family is "DailyTimetable" (NOT "DailyTrainTimetable" --
+  // that path never existed, which is why every earlier guess 404'd).
+  // Confirmed against TDX's own generated API client source
+  // (github.com/minchao/go-ptx, rail/v2/client/t_r_a/tra_client.go):
+  //   GET /v2/Rail/TRA/DailyTimetable/Today/TrainNo/{TrainNo}
+  //   GET /v2/Rail/TRA/DailyTimetable/TrainNo/{TrainNo}/TrainDate/{TrainDate}   (note: TrainNo before TrainDate)
+  //   GET /v2/Rail/TRA/GeneralTimetable/TrainNo/{TrainNo}                      (regular/undated schedule, always available as a last resort)
   function timetableCandidates(trainNo){
     var n = encodeURIComponent(trainNo);
     var d = todayStr();
     return [
-      BASE + "/v2/Rail/TRA/DailyTrainTimetable/Today/TrainNo/" + n + "?$format=JSON",
-      BASE + "/v2/Rail/TRA/DailyTrainTimetable/TrainDate/" + d + "/TrainNo/" + n + "?$format=JSON"
+      BASE + "/v2/Rail/TRA/DailyTimetable/Today/TrainNo/" + n + "?$format=JSON",
+      BASE + "/v2/Rail/TRA/DailyTimetable/TrainNo/" + n + "/TrainDate/" + d + "?$format=JSON",
+      BASE + "/v2/Rail/TRA/GeneralTimetable/TrainNo/" + n + "?$format=JSON"
     ];
   }
   // Unwraps whatever shape the timetable endpoint answers with down to a
@@ -658,14 +659,15 @@
         if(arrProp) arr = data[arrProp];
       }
     }
-    // confirmed real shape: [{ TrainInfo:{...}, StopTimes:[...] }] or
-    // [{ TrainInfo:{..., StopTimes:[...]} }] — StopTimes sits one level
-    // down inside each array element (sibling of or nested in TrainInfo),
-    // not directly on the element itself, so the generic one-level search
-    // above misses it. Check that specific, confirmed-working shape first.
+    // Confirmed real response shapes (from TDX's own API client source):
+    //  - DailyTimetable/*: [{ DailyTrainInfo:{...}, StopTimes:[...], TrainDate, ... }]
+    //    (StopTimes sits directly on the element, sibling of DailyTrainInfo)
+    //  - GeneralTimetable/TrainNo/*: [{ GeneralTimetable:{ GeneralTrainInfo, StopTimes:[...] }, ... }]
+    //    (StopTimes is nested one level down inside GeneralTimetable)
     if(arr && arr.length && !pick(arr[0], ["StationID"])){
       var el = arr[0];
       if(Array.isArray(el.StopTimes)) arr = el.StopTimes;
+      else if(el.GeneralTimetable && Array.isArray(el.GeneralTimetable.StopTimes)) arr = el.GeneralTimetable.StopTimes;
       else if(el.TrainInfo && Array.isArray(el.TrainInfo.StopTimes)) arr = el.TrainInfo.StopTimes;
     }
     if(!arr || !arr.length) return null;
