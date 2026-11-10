@@ -165,14 +165,12 @@
     ];
   }
   var COLORS = ["#ff7a1a","#3ecf8e","#4da6ff","#ff5d9e","#ffd23f"];
-  // TDX's own response tells us how often ITS data actually refreshes:
-  // the envelope we saw back carries UpdateInterval:30 / SrcUpdateInterval:60
-  // (seconds), meaning the upstream board itself only moves every 30-60s.
-  // Polling much faster than that just re-fetches an unchanged reading, so
-  // 15s is close to the useful floor; the illusion of continuous motion
-  // between those real updates comes from the dead-reckoning glide below,
-  // not from polling faster.
-  var POLL_MS = 15000;
+  // TDX's own response tells us how often ITS data actually refreshes: the
+  // envelope carries UpdateInterval:30 (seconds), so match that exactly —
+  // polling faster just re-fetches an unchanged reading. The illusion of
+  // continuous motion between those real updates comes from the
+  // dead-reckoning glide below, not from polling faster than the source.
+  var POLL_MS = 30000;
   var MAX_TRAINS = 5;
   var MAX_KEYS = 5;
 
@@ -801,6 +799,17 @@
 
   $("startBtn").addEventListener("click", function(){
     if(running) stop(); else start();
+  });
+
+  // Mobile browsers throttle/freeze timers for a backgrounded tab to save
+  // battery, so a 30s poll can silently stall for minutes while the phone
+  // is locked or another app is in front. Catch up immediately instead of
+  // waiting for the next scheduled tick whenever the page becomes visible
+  // again.
+  document.addEventListener("visibilitychange", function(){
+    if(!document.hidden && running){
+      pollAll();
+    }
   });
   $("clearBtn").addEventListener("click", function(){
     $("status").innerHTML = "";
