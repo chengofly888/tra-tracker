@@ -556,7 +556,14 @@
     return attempt(0);
   }
 
-  function authedFetch(url){
+  function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+
+  // TDX enforces a per-key rate limit; a burst of startup calls (station
+  // list + line geometry + per-train live board/timetable) can trip it with
+  // 429s even though each individual call is legitimate. Retry those with
+  // a short backoff instead of treating them as a hard failure.
+  function authedFetch(url, retriesLeft){
+    if(retriesLeft === undefined) retriesLeft = 3;
     return getToken().then(function(tok){
       return fetch(url, {headers: {"Authorization": "Bearer " + tok}});
     }).then(function(res){
@@ -569,6 +576,11 @@
         return getToken().then(function(tok2){
           return fetch(url, {headers:{"Authorization":"Bearer "+tok2}});
         });
+      }
+      if(res.status === 429 && retriesLeft > 0){
+        var waitMs = (4 - retriesLeft) * 1500 + 1000; // 1s, 2.5s, 4s backoff
+        log("TDX 速率限制（429），" + (waitMs/1000) + " 秒後重試…", "err");
+        return sleep(waitMs).then(function(){ return authedFetch(url, retriesLeft - 1); });
       }
       return res;
     });
@@ -627,10 +639,18 @@
   function loadRailGeometry(){
     if(railGeometryLoaded) return Promise.resolve();
     log("載入軌道線形與里程資料…");
-    return Promise.all([
-      authedFetch(SHAPE_URL).then(function(res){ return res.ok ? res.json() : []; }).catch(function(){ return []; }),
-      authedFetch(STATION_OF_LINE_URL).then(function(res){ return res.ok ? res.json() : []; }).catch(function(){ return []; })
-    ]).then(function(results){
+    // Sequential, not Promise.all: firing every startup call at once is
+    // what was tripping TDX's rate limit (429) even on first use of a
+    // fresh key. A small stagger between calls avoids that burst.
+    return authedFetch(SHAPE_URL).then(function(res){ return res.ok ? res.json() : []; }).catch(function(){ return []; })
+      .then(function(shapeData){
+        return sleep(400).then(function(){ return shapeData; });
+      })
+      .then(function(shapeData){
+        return authedFetch(STATION_OF_LINE_URL).then(function(res){ return res.ok ? res.json() : []; }).catch(function(){ return []; })
+          .then(function(solData){ return [shapeData, solData]; });
+      })
+      .then(function(results){
       var shapes = Array.isArray(results[0]) ? results[0] : [];
       var sol = Array.isArray(results[1]) ? results[1] : [];
       shapes.forEach(function(row){
@@ -1227,6 +1247,8 @@
     log("開始追蹤，每 " + Math.round(POLL_MS/1000) + " 秒更新一次。");
 
     loadStations().then(function(){
+      return sleep(400); // stagger startup calls to avoid tripping TDX's rate limit
+    }).then(function(){
       // best-effort: hazard-zone checks and curved-track interpolation are
       // a bonus feature, so a failure here must not block tracking itself
       return loadRailGeometry().catch(function(){});
