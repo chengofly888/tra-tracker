@@ -626,7 +626,7 @@
         return tb.localeCompare(ta);
       });
       var info = parseRow(rows[0]);
-      updateTrainCard(trainNo, info, color, null);
+      updateTrainCard(trainNo, info, color, null, false, false, rows[0], false);
 
       var cur = stationById[info.stationId];
       if(!cur){
@@ -666,7 +666,7 @@
 
       trainState[trainNo].lastInfo = info;
       trainState[trainNo].lastSeen = Date.now();
-      updateTrainCard(trainNo, info, color, cur);
+      updateTrainCard(trainNo, info, color, cur, false, false, rows[0], !!target);
       log("車次 " + trainNo + " 更新：" + (cur.name||info.stationId) +
           "，誤點 " + (info.delay||0) + " 分。", "ok");
     }).catch(function(err){
@@ -680,7 +680,21 @@
     });
   }
 
-  function updateTrainCard(trainNo, info, color, stationObj, failed, noData){
+  function debugDetailsHtml(trainNo, rawRow, hasTarget){
+    if(!rawRow) return "";
+    var raw = "";
+    try{ raw = JSON.stringify(rawRow, null, 1); }catch(e){ raw = String(rawRow); }
+    raw = raw.replace(/</g,"&lt;");
+    return '<details style="margin-top:6px;">' +
+      '<summary style="cursor:pointer;font-size:11px;color:var(--fg-dim);">原始資料／除錯（下一站：' +
+      (hasTarget ? '<span style="color:var(--ok)">已解析</span>' : '<span style="color:var(--err)">未知</span>') +
+      '）</summary>' +
+      '<pre style="white-space:pre-wrap;word-break:break-all;font-size:10px;color:#8fa0b5;' +
+      'background:#0c1118;border-radius:6px;padding:6px;margin-top:4px;max-height:160px;overflow:auto;">' +
+      raw + '</pre></details>';
+  }
+
+  function updateTrainCard(trainNo, info, color, stationObj, failed, noData, rawRow, hasTarget){
     var el = $("card_" + trainNo);
     if(!el){
       el = document.createElement("div");
@@ -690,11 +704,13 @@
       $("cards").appendChild(el);
     }
     if(failed){
-      el.innerHTML = '<div class="no">車次 '+trainNo+'</div><div class="st" style="color:var(--err)">查詢失敗，稍後重試中…</div>';
+      el.innerHTML = '<div class="no">車次 '+trainNo+'</div><div class="st" style="color:var(--err)">查詢失敗，稍後重試中…</div>' +
+        debugDetailsHtml(trainNo, rawRow, hasTarget);
       return;
     }
     if(noData){
-      el.innerHTML = '<div class="no">車次 '+trainNo+'</div><div class="st" style="color:var(--fg-dim)">目前查無即時資料（尚未發車／已到站／非今日班次）</div>';
+      el.innerHTML = '<div class="no">車次 '+trainNo+'</div><div class="st" style="color:var(--fg-dim)">目前查無即時資料（尚未發車／已到站／非今日班次）</div>' +
+        debugDetailsHtml(trainNo, rawRow, hasTarget);
       return;
     }
     if(!info){
@@ -707,7 +723,8 @@
       '<div class="no"><span class="pulse" style="--c:'+color+'"></span>車次 '+trainNo+'</div>' +
       '<div class="st">目前位置：'+ (info.stationName || stationObj && stationObj.name || info.stationId || "未知") +
       '<span class="delay '+delayCls+'">'+delayTxt+'</span></div>' +
-      '<div class="meta">終點：'+(info.endingStationName||"—")+' ・ 更新時間：'+(info.updateTime||"—")+'</div>';
+      '<div class="meta">終點：'+(info.endingStationName||"—")+' ・ 更新時間：'+(info.updateTime||"—")+'</div>' +
+      debugDetailsHtml(trainNo, rawRow, hasTarget);
   }
 
   // ---------- polling loop ----------
@@ -718,20 +735,25 @@
     }).filter(Boolean);
   }
 
+  var didInitialFit = false; // only auto-center/zoom once; never fight the user's own pan/zoom afterward
+
   function pollAll(){
     var trains = activeTrains();
     trains.forEach(function(t){
       if(!trainState[t.no]) trainState[t.no] = {};
       pollOne(t.no, t.color);
     });
-    if(trains.length){
+    if(trains.length && !didInitialFit){
       var bounds = [];
       trains.forEach(function(t){
         if(trainState[t.no] && trainState[t.no].marker){
           bounds.push(trainState[t.no].marker.getLatLng());
         }
       });
-      if(bounds.length) map.fitBounds(bounds, {padding:[60,60], maxZoom: 12});
+      if(bounds.length){
+        map.fitBounds(bounds, {padding:[60,60], maxZoom: 12});
+        didInitialFit = true;
+      }
     }
   }
 
@@ -750,6 +772,7 @@
     $("cards").innerHTML = "";
     trainState = {};
     liveEndpointWinner = {};
+    didInitialFit = false;
     running = true;
     $("startBtn").textContent = "停止追蹤";
     $("startBtn").classList.add("stop");
