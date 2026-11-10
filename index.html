@@ -89,7 +89,7 @@
     70%{box-shadow:0 0 0 8px transparent}100%{box-shadow:0 0 0 0 transparent}}
   .train-dot{border-radius:50%;border:2px solid #fff;box-shadow:0 0 6px rgba(0,0,0,.5);
     display:flex;align-items:center;justify-content:center;color:#fff;font-family:var(--mono);
-    font-weight:800;font-size:10px;transition:left .9s linear, top .9s linear;}
+    font-weight:800;font-size:10px;}
   .leaflet-container{background:#0a0e14;}
   @media (max-width:760px){
     #layout{flex-direction:column;}
@@ -165,7 +165,14 @@
     ];
   }
   var COLORS = ["#ff7a1a","#3ecf8e","#4da6ff","#ff5d9e","#ffd23f"];
-  var POLL_MS = 25000;
+  // TDX's own response tells us how often ITS data actually refreshes:
+  // the envelope we saw back carries UpdateInterval:30 / SrcUpdateInterval:60
+  // (seconds), meaning the upstream board itself only moves every 30-60s.
+  // Polling much faster than that just re-fetches an unchanged reading, so
+  // 15s is close to the useful floor; the illusion of continuous motion
+  // between those real updates comes from the dead-reckoning glide below,
+  // not from polling faster.
+  var POLL_MS = 15000;
   var MAX_TRAINS = 5;
   var MAX_KEYS = 5;
 
@@ -344,16 +351,86 @@
     return m;
   }
 
-  function animateMarkerTo(marker, fromLatLng, toLatLng, ms){
-    var start = performance.now();
-    function step(ts){
-      var p = Math.min(1, (ts-start)/ms);
-      var lat = fromLatLng[0] + (toLatLng[0]-fromLatLng[0])*p;
-      var lon = fromLatLng[1] + (toLatLng[1]-fromLatLng[1])*p;
-      marker.setLatLng([lat, lon]);
-      if(p < 1) requestAnimationFrame(step);
+  // ---------- dead-reckoning between polls ----------
+  // TDX only tells us which station a train is at (or last reported) every
+  // ~25-60s; it gives no continuous GPS. To avoid the dot sitting still and
+  // then jumping, we estimate the train's speed from how fast it actually
+  // covered the previous station-to-station segment, then keep sliding the
+  // dot toward the next station at that estimated pace every animation
+  // frame, in between polls. A fresh poll either confirms arrival (resets
+  // the segment and refines the speed estimate) or, if the train is still
+  // between the same two stations, just lets the existing glide continue.
+  var EARTH_R = 6371000;
+  var DEFAULT_SPEED_MPS = 16.7;      // ~60km/h, used only until a real segment is measured
+  var MIN_SPEED_MPS = 3;             // ~11km/h floor
+  var MAX_SPEED_MPS = 42;            // ~150km/h ceiling, generous for TRA
+  var MAX_SEGMENT_FRACTION = 0.97;   // never let the dot reach the next station on its own; a poll must confirm it
+
+  function haversineMeters(a, b){
+    var toRad = function(d){ return d * Math.PI / 180; };
+    var dLat = toRad(b.lat - a.lat), dLon = toRad(b.lon - a.lon);
+    var lat1 = toRad(a.lat), lat2 = toRad(b.lat);
+    var h = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)*Math.sin(dLon/2);
+    return 2 * EARTH_R * Math.asin(Math.min(1, Math.sqrt(h)));
+  }
+
+  // Called whenever a poll confirms a station fix. Decides whether this is
+  // a new segment (station advanced -> measure real speed from the last
+  // segment) or the same segment continuing (just let the glide keep going).
+  function updateDeadReckoning(trainNo, info, cur, target){
+    var st = trainState[trainNo];
+    var nowT = Date.now();
+    if(!st.segStart){
+      st.lastConfirmedStationId = info.stationId;
+      st.segStart = {lat: cur.lat, lon: cur.lon, t: nowT};
+      st.segEnd = target ? {lat: target.lat, lon: target.lon} : {lat: cur.lat, lon: cur.lon};
+      st.estSpeedMps = DEFAULT_SPEED_MPS;
+      ensureMarker(trainNo, st.color).setLatLng([cur.lat, cur.lon]);
+      return;
     }
-    requestAnimationFrame(step);
+    if(info.stationId !== st.lastConfirmedStationId){
+      // station advanced since the last poll: measure how fast it actually
+      // covered that ground and fold it into the speed estimate (smoothed,
+      // so one noisy reading doesn't swing the pace wildly)
+      var elapsedSec = Math.max(1, (nowT - st.segStart.t) / 1000);
+      var distM = haversineMeters(st.segStart, {lat: cur.lat, lon: cur.lon});
+      var measured = distM / elapsedSec;
+      var blended = st.estSpeedMps ? (st.estSpeedMps * 0.4 + measured * 0.6) : measured;
+      st.estSpeedMps = Math.min(MAX_SPEED_MPS, Math.max(MIN_SPEED_MPS, blended));
+      st.lastConfirmedStationId = info.stationId;
+      st.segStart = {lat: cur.lat, lon: cur.lon, t: nowT};
+      st.segEnd = target ? {lat: target.lat, lon: target.lon} : {lat: cur.lat, lon: cur.lon};
+    } else if(target){
+      // same segment still in progress: just keep the existing glide's
+      // start time/speed as-is, but refresh the target in case the
+      // "next station" field itself changed (e.g. direction correction)
+      st.segEnd = {lat: target.lat, lon: target.lon};
+    }
+  }
+
+  var rafRunning = false;
+  function driveDeadReckoning(){
+    Object.keys(trainState).forEach(function(no){
+      var st = trainState[no];
+      if(!st || !st.marker || !st.segStart || !st.segEnd) return;
+      var totalDist = haversineMeters(st.segStart, st.segEnd);
+      if(totalDist < 5){ return; } // already there / no known next station
+      var elapsedSec = (Date.now() - st.segStart.t) / 1000;
+      var traveled = (st.estSpeedMps || DEFAULT_SPEED_MPS) * elapsedSec;
+      var frac = Math.min(traveled / totalDist, MAX_SEGMENT_FRACTION);
+      var lat = st.segStart.lat + (st.segEnd.lat - st.segStart.lat) * frac;
+      var lon = st.segStart.lon + (st.segEnd.lon - st.segStart.lon) * frac;
+      st.marker.setLatLng([lat, lon]);
+    });
+    if(rafRunning) requestAnimationFrame(driveDeadReckoning);
+  }
+  function startDeadReckoning(){
+    if(rafRunning) return;
+    rafRunning = true;
+    requestAnimationFrame(driveDeadReckoning);
+  }
+  function stopDeadReckoning(){
+    rafRunning = false;
   }
 
   // ---------- TDX auth ----------
@@ -566,9 +643,8 @@
         return;
       }
       var target = stationById[info.nextStationId] || null;
-      var marker = ensureMarker(trainNo, color);
-      var from = marker.getLatLng();
-      var fromArr = (from.lat === 0 && from.lng === 0) ? [cur.lat, cur.lon] : [from.lat, from.lng];
+      trainState[trainNo].color = color;
+      updateDeadReckoning(trainNo, info, cur, target);
 
       if(glideLines[trainNo]) map.removeLayer(glideLines[trainNo]);
       if(target){
@@ -576,7 +652,6 @@
           color: color, weight: 2, opacity: .5, dashArray: "4,6"
         }).addTo(map);
       }
-      animateMarkerTo(marker, fromArr, [cur.lat, cur.lon], 900);
 
       trainState[trainNo].lastInfo = info;
       trainState[trainNo].lastSeen = Date.now();
@@ -672,6 +747,7 @@
     loadStations().then(function(){
       pollAll();
       pollTimer = setInterval(pollAll, POLL_MS);
+      startDeadReckoning();
     }).catch(function(){
       running = false;
       $("startBtn").textContent = "開始追蹤";
@@ -683,6 +759,7 @@
     running = false;
     if(pollTimer) clearInterval(pollTimer);
     pollTimer = null;
+    stopDeadReckoning();
     $("startBtn").textContent = "開始追蹤";
     $("startBtn").classList.remove("stop");
     log("已停止追蹤。");
