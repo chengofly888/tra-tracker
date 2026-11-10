@@ -90,6 +90,12 @@
   .train-dot{border-radius:50%;border:2px solid #fff;box-shadow:0 0 6px rgba(0,0,0,.5);
     display:flex;align-items:center;justify-content:center;color:#fff;font-family:var(--mono);
     font-weight:800;font-size:10px;}
+  .train-dot.hazard{background:#e3253b !important;animation:hazardBlink 0.9s infinite;}
+  @keyframes hazardBlink{0%{box-shadow:0 0 6px rgba(227,37,59,.9),0 0 0 0 rgba(227,37,59,.8);}
+    70%{box-shadow:0 0 6px rgba(227,37,59,.9),0 0 0 14px rgba(227,37,59,0);}
+    100%{box-shadow:0 0 6px rgba(227,37,59,.9),0 0 0 0 rgba(227,37,59,0);}}
+  .hazard-banner{margin-top:6px;padding:6px 8px;border-radius:7px;font-size:12px;font-weight:700;
+    background:#3a0b10;color:#ff8a93;border:1px solid #e3253b;}
   .leaflet-container{background:#0a0e14;}
   @media (max-width:760px){
     #layout{flex-direction:column;}
@@ -152,6 +158,19 @@
   var AUTH_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token";
   var BASE = "https://tdx.transportdata.tw/api/basic";
   var STATION_URL = BASE + "/v2/Rail/TRA/Station?$format=JSON";
+  // Rail line geometry (polyline shape) and per-line station mileage, both
+  // return every line in one call (no path parameter) per TDX's own API
+  // client source — no need to know a line's code ahead of time.
+  var SHAPE_URL = BASE + "/v2/Rail/TRA/Shape?$format=JSON";
+  var STATION_OF_LINE_URL = BASE + "/v2/Rail/TRA/StationOfLine?$format=JSON";
+
+  // ---------- hazard zones (slope/rockfall watch sections) ----------
+  // Track mileage (K-marks) along the named line; line name must match the
+  // Shape API's LineName.Zh_tw exactly. Add more sections here as needed.
+  var HAZARD_ZONES = [
+    { id: "HZ-01", name: "和仁-崇德落石易發段", line: "北迴線", startKm: 48.5, endKm: 51.2, riskLevel: "HIGH" },
+    { id: "HZ-02", name: "猴硐-三貂嶺邊坡段", line: "宜蘭線", startKm: 12.0, endKm: 13.5, riskLevel: "WARNING" }
+  ];
   // Candidate live-position endpoints, tried in order per train until one works.
   // TDX's live train-position dataset has been served under a couple of different
   // path/version spellings over time, so we probe them instead of hardcoding one.
@@ -178,6 +197,11 @@
   var keyWorkingIndex = 0;      // which key slot currently works, by DOM position
   var token = null, tokenExpiry = 0;
   var stationById = {};         // StationID -> {name, lat, lon}
+  var lineShapes = {};          // LineID -> [{lat,lon}, ...] polyline vertices, in Shape's original order
+  var lineNames = {};           // LineID -> Chinese line name (matches HAZARD_ZONES[].line)
+  var lineStations = {};        // LineID -> { StationID -> kmMark }
+  var stationToLine = {};       // StationID -> LineID (first line found containing it)
+  var railGeometryLoaded = false;
   var liveEndpointWinner = {};  // trainNo -> url template index that worked last time
   var trainState = {};          // trainNo -> {stationId, nextStationId, delay, updateTime, marker, ...}
   var pollTimer = null;
@@ -410,14 +434,35 @@
   function driveDeadReckoning(){
     Object.keys(trainState).forEach(function(no){
       var st = trainState[no];
-      if(!st || !st.marker || !st.segStart || !st.segEnd) return;
+      if(!st || !st.marker) return;
+      var win = st.scheduleWindow;
+      if(win){
+        // Preferred path: real schedule times + real track geometry. No
+        // speed estimate needed -- progress through the depMs..arrMs
+        // window IS the position, recomputed fresh every frame straight
+        // from the wall clock, then walked along the actual polyline by
+        // arc length (never a straight lat/lon lerp between the stations).
+        var frac = (Date.now() - win.depMs) / (win.arrMs - win.depMs);
+        frac = Math.max(0, Math.min(1, frac));
+        var pt = pointAtArcLengthFraction(win.subCoords, frac);
+        st.marker.setLatLng([pt.lat, pt.lon]);
+        var km = win.kmCur + (win.kmNext - win.kmCur) * frac;
+        st.lastKm = km;
+        st.lastLineName = win.lineName;
+        applyHazardState(no, findHazardZone(win.lineName, km), km);
+        return;
+      }
+      if(!st.segStart || !st.segEnd) return;
+      // Fallback: no usable schedule/geometry data for this leg (different
+      // lines at a junction, missing timetable, etc) -- plain straight-line
+      // glide at the speed estimated from the train's last real segment.
       var totalDist = haversineMeters(st.segStart, st.segEnd);
       if(totalDist < 5){ return; } // already there / no known next station
       var elapsedSec = (Date.now() - st.segStart.t) / 1000;
       var traveled = (st.estSpeedMps || DEFAULT_SPEED_MPS) * elapsedSec;
-      var frac = Math.min(traveled / totalDist, MAX_SEGMENT_FRACTION);
-      var lat = st.segStart.lat + (st.segEnd.lat - st.segStart.lat) * frac;
-      var lon = st.segStart.lon + (st.segEnd.lon - st.segStart.lon) * frac;
+      var lfrac = Math.min(traveled / totalDist, MAX_SEGMENT_FRACTION);
+      var lat = st.segStart.lat + (st.segEnd.lat - st.segStart.lat) * lfrac;
+      var lon = st.segStart.lon + (st.segEnd.lon - st.segStart.lon) * lfrac;
       st.marker.setLatLng([lat, lon]);
     });
     if(rafRunning) requestAnimationFrame(driveDeadReckoning);
@@ -554,6 +599,185 @@
     });
   }
 
+  // ---------- rail line geometry + mileage (for curved interpolation & hazard-zone checks) ----------
+  // WKT looks like "LINESTRING (121.123456 25.123456, 121.234567 25.234567, ...)".
+  // WKT coordinate order is (lon, lat) -- opposite of how we store {lat,lon}
+  // everywhere else in this file, so swap on the way in.
+  function parseWktLineString(wkt){
+    if(!wkt || typeof wkt !== "string") return null;
+    var m = wkt.match(/\(\s*([^()]+)\)\s*$/); // last parenthesised group handles LINESTRING and MULTILINESTRING's one segment alike
+    if(!m) return null;
+    var pts = m[1].split(",").map(function(pair){
+      var xy = pair.trim().split(/\s+/);
+      var lon = parseFloat(xy[0]), lat = parseFloat(xy[1]);
+      if(!isFinite(lon) || !isFinite(lat)) return null;
+      return {lat:lat, lon:lon};
+    }).filter(Boolean);
+    return pts.length >= 2 ? pts : null;
+  }
+
+  // Fetches every TRA line's polyline geometry (Shape) and per-station
+  // cumulative mileage (StationOfLine) in one pass each; both endpoints
+  // return ALL lines at once (no per-line path parameter), confirmed from
+  // TDX's own generated API client. Used for: (a) curving the dot along
+  // the real track between two stations instead of a straight line, and
+  // (b) computing the train's track mileage (K-mark) for hazard-zone checks.
+  // Best-effort: if this fails, pollOne/driveDeadReckoning fall back to the
+  // plain straight-line + speed-estimate glide with no mileage/hazard check.
+  function loadRailGeometry(){
+    if(railGeometryLoaded) return Promise.resolve();
+    log("載入軌道線形與里程資料…");
+    return Promise.all([
+      authedFetch(SHAPE_URL).then(function(res){ return res.ok ? res.json() : []; }).catch(function(){ return []; }),
+      authedFetch(STATION_OF_LINE_URL).then(function(res){ return res.ok ? res.json() : []; }).catch(function(){ return []; })
+    ]).then(function(results){
+      var shapes = Array.isArray(results[0]) ? results[0] : [];
+      var sol = Array.isArray(results[1]) ? results[1] : [];
+      shapes.forEach(function(row){
+        var lineId = String(pick(row, ["LineID"]) || "");
+        var wkt = pick(row, ["Geometry"]);
+        var pts = parseWktLineString(wkt);
+        if(lineId && pts){
+          lineShapes[lineId] = pts;
+          lineNames[lineId] = zh(pick(row, ["LineName"])) || lineId;
+        }
+      });
+      sol.forEach(function(row){
+        var lineId = String(pick(row, ["LineID"]) || "");
+        var stations = pick(row, ["Stations"]);
+        if(!lineId || !Array.isArray(stations)) return;
+        var km = {};
+        stations.forEach(function(s){
+          var sid = String(pick(s, ["StationID"]) || "");
+          var dist = pick(s, ["TraveledDistance"]);
+          if(sid && dist != null){
+            km[sid] = parseFloat(dist);
+            if(stationToLine[sid] === undefined) stationToLine[sid] = lineId;
+          }
+        });
+        lineStations[lineId] = km;
+      });
+      railGeometryLoaded = true;
+      log("軌道線形載入完成，共 " + Object.keys(lineShapes).length + " 條路線（含里程資料 " +
+          Object.keys(lineStations).length + " 條）。", "ok");
+    }).catch(function(err){
+      log("軌道線形資料載入失敗（" + err.message + "），邊坡警戒與沿線曲線移動將停用，僅保留直線估算。", "err");
+    });
+  }
+
+  function nearestPointIndex(coords, latlon){
+    var best = 0, bestD = Infinity;
+    for(var i=0;i<coords.length;i++){
+      var d = haversineMeters(coords[i], latlon);
+      if(d < bestD){ bestD = d; best = i; }
+    }
+    return best;
+  }
+
+  // Cuts the sub-array of a line's polyline between the two stations'
+  // nearest vertices, always ordered current -> next (reversed if the
+  // line's own point order runs the other way for this direction of travel).
+  function sliceLineBetween(coords, aLatLon, bLatLon){
+    var ia = nearestPointIndex(coords, aLatLon);
+    var ib = nearestPointIndex(coords, bLatLon);
+    if(ia === ib) return null;
+    var sub = ia < ib ? coords.slice(ia, ib+1) : coords.slice(ib, ia+1).slice().reverse();
+    return sub.length >= 2 ? sub : null;
+  }
+
+  // Walks a polyline sub-array by real along-track (arc-length) distance --
+  // never a straight-line lerp between the two endpoint stations -- and
+  // returns the point at the given progress fraction (0..1) of its total length.
+  function pointAtArcLengthFraction(subCoords, frac){
+    frac = Math.max(0, Math.min(1, frac));
+    var segLens = [];
+    var total = 0;
+    for(var i=0;i<subCoords.length-1;i++){
+      var d = haversineMeters(subCoords[i], subCoords[i+1]);
+      segLens.push(d);
+      total += d;
+    }
+    if(total <= 0) return subCoords[0];
+    var target = frac * total;
+    var acc = 0;
+    for(var j=0;j<segLens.length;j++){
+      if(acc + segLens[j] >= target || j === segLens.length-1){
+        var segFrac = segLens[j] > 0 ? (target - acc) / segLens[j] : 0;
+        segFrac = Math.max(0, Math.min(1, segFrac));
+        var a = subCoords[j], b = subCoords[j+1];
+        return {lat: a.lat + (b.lat-a.lat)*segFrac, lon: a.lon + (b.lon-a.lon)*segFrac};
+      }
+      acc += segLens[j];
+    }
+    return subCoords[subCoords.length-1];
+  }
+
+  // Builds everything pollOne/driveDeadReckoning need to curve a train
+  // between its current and next station along the real track and derive
+  // its mileage, or null if the geometry/mileage data can't support it
+  // (different lines, missing station in the mileage table, etc).
+  function buildTrackSegment(curStationId, nextStationId, curLatLon, nextLatLon){
+    if(!railGeometryLoaded) return null;
+    var lineId = stationToLine[curStationId] || stationToLine[nextStationId];
+    if(!lineId || !lineShapes[lineId] || !lineStations[lineId]) return null;
+    var kmCur = lineStations[lineId][curStationId];
+    var kmNext = lineStations[lineId][nextStationId];
+    if(kmCur == null || kmNext == null) return null;
+    var sub = sliceLineBetween(lineShapes[lineId], curLatLon, nextLatLon);
+    if(!sub) return null;
+    return {lineId: lineId, lineName: lineNames[lineId] || lineId, subCoords: sub, kmCur: kmCur, kmNext: kmNext};
+  }
+
+  // Finds the hazard zone (if any) a given line+mileage falls inside.
+  function findHazardZone(lineName, km){
+    for(var i=0;i<HAZARD_ZONES.length;i++){
+      var z = HAZARD_ZONES[i];
+      if(z.line !== lineName) continue;
+      var lo = Math.min(z.startKm, z.endKm), hi = Math.max(z.startKm, z.endKm);
+      if(km >= lo && km <= hi) return z;
+    }
+    return null;
+  }
+
+  // Called every time a train's mileage is (re)computed. Flags entry/exit
+  // transitions with a log line and toggles the marker's red-blink state;
+  // returns the currently-active zone (or null) so the caller can show it.
+  function applyHazardState(trainNo, zone, km){
+    var st = trainState[trainNo];
+    var prev = st.activeHazard || null;
+    if(zone && (!prev || prev.id !== zone.id)){
+      log("【警告】車次 " + trainNo + " 已進入 " + zone.id + " " + zone.name +
+          "，目前推估里程 K" + km.toFixed(1) + "（警戒等級：" + zone.riskLevel + "）。", "err");
+    } else if(!zone && prev){
+      log("車次 " + trainNo + " 已駛離 " + prev.id + " " + prev.name + " 警戒區間。", "ok");
+    }
+    st.activeHazard = zone;
+    if(st.marker){
+      var el = st.marker.getElement && st.marker.getElement();
+      var dot = el && el.querySelector && el.querySelector(".train-dot");
+      if(dot) dot.classList.toggle("hazard", !!zone);
+    }
+    // Runs every animation frame (far more often than the card's own 30s
+    // poll-driven redraw), so keep the card's hazard banner in sync here
+    // too -- otherwise it'd only reflect whatever was true at the last poll.
+    var card = $("card_" + trainNo);
+    if(card){
+      var banner = card.querySelector(".hazard-banner");
+      if(zone){
+        if(!banner){
+          banner = document.createElement("div");
+          banner.className = "hazard-banner";
+          card.appendChild(banner);
+        }
+        banner.textContent = "【警告】已進入 " + zone.id + " " + zone.name +
+          "（" + zone.riskLevel + "）・目前里程 K" + km.toFixed(1);
+      } else if(banner){
+        banner.remove();
+      }
+    }
+    return zone;
+  }
+
   // ---------- live position polling ----------
   // TDX wraps several of its rail endpoints in an envelope object
   // ({UpdateTime, ..., TrainLiveBoards:[...]}) rather than returning a bare
@@ -687,7 +911,8 @@
         id: String(sid || ""),
         seq: pick(row, ["StopSequence","Sequence","StationSequence"]),
         order: i,
-        arrivalTime: pick(row, ["ArrivalTime","ArriveTime"]) || null
+        arrivalTime: pick(row, ["ArrivalTime","ArriveTime"]) || null,
+        departureTime: pick(row, ["DepartureTime","DepartTime"]) || null
       };
     }).filter(function(s){ return s.id; });
     if(!stops.length) return null;
@@ -765,6 +990,9 @@
   }
   // Returns {id, arrivalTime} for the stop right after the train's current
   // station in its own stop sequence, or null if that can't be worked out.
+  // Returns both the current stop and next stop's full records (so callers
+  // can get at departureTime/arrivalTime for schedule-based progress, not
+  // just the next station's id).
   function nextStationFromTimetable(trainNo, currentStationId){
     var st = trainState[trainNo];
     if(!st.timetableStations) return null;
@@ -772,7 +1000,37 @@
     var idx = -1;
     for(var i=0;i<stops.length;i++){ if(stops[i].id === currentStationId){ idx = i; break; } }
     if(idx < 0 || idx+1 >= stops.length) return null;
-    return {id: stops[idx+1].id, arrivalTime: stops[idx+1].arrivalTime};
+    return {id: stops[idx+1].id, arrivalTime: stops[idx+1].arrivalTime, cur: stops[idx], next: stops[idx+1]};
+  }
+
+  // Converts a TDX "HH:mm:ss" (or "HH:mm") time-of-day string to an epoch ms
+  // timestamp on today's date. Returns null if the string can't be parsed.
+  function hmsToMs(hms){
+    if(!hms) return null;
+    var m = String(hms).match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    if(!m) return null;
+    var now = new Date();
+    var d = new Date(now.getFullYear(), now.getMonth(), now.getDate(),
+      parseInt(m[1],10), parseInt(m[2],10), m[3]?parseInt(m[3],10):0);
+    return d.getTime();
+  }
+
+  // Schedule-based progress window for the current station->next station leg:
+  // departure time at the current stop through arrival time at the next one,
+  // both nudged by the train's currently-reported delay. Progress through
+  // this window (clamped 0..1, recomputed fresh every animation frame from
+  // the wall clock) drives the curved-track position and mileage -- no
+  // speed estimate needed when real schedule times are available.
+  function computeScheduleWindow(curStop, nextStop, delayMin){
+    if(!curStop || !nextStop) return null;
+    var depRaw = hmsToMs(curStop.departureTime || curStop.arrivalTime);
+    var arrRaw = hmsToMs(nextStop.arrivalTime || nextStop.departureTime);
+    if(depRaw == null || arrRaw == null) return null;
+    if(arrRaw <= depRaw) arrRaw += 24*3600*1000; // this leg crosses midnight
+    var delayMs = (delayMin || 0) * 60000;
+    var depMs = depRaw + delayMs, arrMs = arrRaw + delayMs;
+    if(arrMs <= depMs) return null;
+    return {depMs: depMs, arrMs: arrMs};
   }
 
   function pollOne(trainNo, color){
@@ -806,6 +1064,24 @@
 
       trainState[trainNo].color = color;
       updateDeadReckoning(trainNo, info, cur, target);
+
+      // Prefer curving the dot along the real track (+ computing mileage
+      // for the hazard-zone check) whenever we have both the line geometry
+      // and a usable schedule window; driveDeadReckoning() picks this up
+      // every animation frame. Falls back to the plain straight-line/speed
+      // glide above when either is missing (e.g. different lines meeting
+      // at a junction, or this leg's times didn't parse).
+      trainState[trainNo].scheduleWindow = null;
+      if(target && cur){
+        var seg = buildTrackSegment(info.stationId, next.id, cur, target);
+        var win = seg ? computeScheduleWindow(next.cur, next.next, info.delay) : null;
+        if(seg && win){
+          trainState[trainNo].scheduleWindow = {
+            depMs: win.depMs, arrMs: win.arrMs,
+            subCoords: seg.subCoords, kmCur: seg.kmCur, kmNext: seg.kmNext, lineName: seg.lineName
+          };
+        }
+      }
 
       if(glideLines[trainNo]) map.removeLayer(glideLines[trainNo]);
       if(target){
@@ -875,13 +1151,28 @@
     var nextTxt = target ?
       ("下一站：" + (target.name || "—") + (nextArrival ? "（預計 " + nextArrival + " 到站）" : "")) :
       "下一站：推算中…";
+    var st = trainState[trainNo] || {};
+    var mileageTxt = (st.lastLineName && st.lastKm != null) ?
+      ('<div class="meta">所在路線：'+st.lastLineName+' ・ 軌道里程：K'+st.lastKm.toFixed(1)+'</div>') : "";
     el.innerHTML =
       '<div class="no"><span class="pulse" style="--c:'+color+'"></span>車次 '+trainNo+'</div>' +
       '<div class="st">目前位置：'+ (info.stationName || stationObj && stationObj.name || info.stationId || "未知") +
       '<span class="delay '+delayCls+'">'+delayTxt+'</span></div>' +
       '<div class="meta">'+nextTxt+'</div>' +
       '<div class="meta">終點：'+(info.endingStationName||"—")+' ・ 更新時間：'+(info.updateTime||"—")+'</div>' +
+      mileageTxt +
       debugDetailsHtml(trainNo, rawRow, hasTarget);
+    // applyHazardState (driven by the per-frame dead-reckoning loop, not
+    // this poll-driven redraw) owns the hazard banner itself; re-append it
+    // here immediately so it survives this innerHTML rewrite without
+    // waiting for the next animation frame to put it back.
+    if(st.activeHazard){
+      var banner = document.createElement("div");
+      banner.className = "hazard-banner";
+      banner.textContent = "【警告】已進入 " + st.activeHazard.id + " " + st.activeHazard.name +
+        "（" + st.activeHazard.riskLevel + "）・目前里程 K" + (st.lastKm != null ? st.lastKm.toFixed(1) : "—");
+      el.appendChild(banner);
+    }
   }
 
   // ---------- polling loop ----------
@@ -936,6 +1227,10 @@
     log("開始追蹤，每 " + Math.round(POLL_MS/1000) + " 秒更新一次。");
 
     loadStations().then(function(){
+      // best-effort: hazard-zone checks and curved-track interpolation are
+      // a bonus feature, so a failure here must not block tracking itself
+      return loadRailGeometry().catch(function(){});
+    }).then(function(){
       pollAll();
       pollTimer = setInterval(pollAll, POLL_MS);
       startDeadReckoning();
