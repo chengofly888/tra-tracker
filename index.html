@@ -573,6 +573,88 @@
     return [];
   }
 
+  // Some TRA rolling stock reports real onboard GPS via a separate TDX
+  // endpoint (TrainLivePosition) rather than just a current-station board.
+  // When it's available for a train, it's strictly better than the
+  // timetable-based estimate below, so try it first and fall back
+  // gracefully when a train has none.
+  function gpsCandidates(trainNo){
+    var n = encodeURIComponent(trainNo);
+    return [
+      BASE + "/v3/Rail/TRA/TrainLivePosition/TrainNo/" + n + "?$format=JSON",
+      BASE + "/v3/Rail/TRA/TrainLivePosition?$filter=TrainNo%20eq%20'" + n + "'&$format=JSON"
+    ];
+  }
+  function extractGpsFix(row){
+    if(!row) return null;
+    var lat = pick(row, ["PositionLat","Latitude","Lat","GPSLat"]);
+    var lon = pick(row, ["PositionLon","Longitude","Lon","GPSLon"]);
+    if(lat == null || lon == null) return null;
+    lat = parseFloat(lat); lon = parseFloat(lon);
+    if(!isFinite(lat) || !isFinite(lon) || (lat === 0 && lon === 0)) return null;
+    return {lat: lat, lon: lon};
+  }
+  function fetchGpsPosition(trainNo){
+    var cands = gpsCandidates(trainNo);
+    var lastRaw = null;
+    function attempt(k){
+      if(k >= cands.length){
+        var e = new Error("gps_not_available");
+        e.raw = lastRaw;
+        return Promise.reject(e);
+      }
+      return authedFetch(cands[k]).then(function(res){
+        if(!res.ok) return attempt(k+1);
+        return res.json().then(function(data){
+          var rows = extractRows(data);
+          if(!rows.length){ lastRaw = data; return attempt(k+1); }
+          var fix = extractGpsFix(rows[0]);
+          if(!fix){ lastRaw = rows[0]; return attempt(k+1); }
+          return fix;
+        }).catch(function(){ return attempt(k+1); });
+      }).catch(function(){ return attempt(k+1); });
+    }
+    return attempt(0);
+  }
+  // Fires on every poll; cheap to keep retrying even after a miss, since a
+  // train could gain/lose GPS coverage. Only logs the "unsupported" state
+  // once per train to avoid spamming the log every 30s.
+  function tryGpsFix(trainNo, color){
+    fetchGpsPosition(trainNo).then(function(fix){
+      var st = trainState[trainNo];
+      if(!st) return;
+      if(!st.gpsConfirmedLogged){
+        st.gpsConfirmedLogged = true;
+        log("車次 " + trainNo + "：偵測到車載 GPS 資料，改用真實座標（比時刻表推算更準確）。", "ok");
+      }
+      var nowT = Date.now();
+      var prev = st.lastGpsFix;
+      if(prev){
+        var distM = haversineMeters(prev, fix);
+        var dt = Math.max(1, (nowT - prev.t) / 1000);
+        var measured = distM / dt;
+        st.estSpeedMps = Math.min(MAX_SPEED_MPS, Math.max(MIN_SPEED_MPS,
+          st.estSpeedMps ? (st.estSpeedMps * 0.3 + measured * 0.7) : measured));
+      }
+      st.lastGpsFix = {lat: fix.lat, lon: fix.lon, t: nowT};
+      st.segStart = {lat: fix.lat, lon: fix.lon, t: nowT};
+      if(!st.segEnd) st.segEnd = {lat: fix.lat, lon: fix.lon};
+      ensureMarker(trainNo, st.color || color).setLatLng([fix.lat, fix.lon]);
+    }).catch(function(err){
+      var st = trainState[trainNo];
+      if(st && !st.gpsDebugLogged){
+        st.gpsDebugLogged = true;
+        log("車次 " + trainNo + "：此車次目前無車載 GPS 資料（" + err.message + "），改用時刻表推算位置。", "err");
+        if(err.raw){
+          try{
+            log("車次 " + trainNo + " GPS 原始回應：<br><span style=\"word-break:break-all;color:#8fa0b5;\">" +
+                JSON.stringify(err.raw).replace(/</g,"&lt;").slice(0,1500) + "</span>", "err");
+          }catch(e){}
+        }
+      }
+    });
+  }
+
   function tryLiveEndpoints(trainNo){
     var cands = liveCandidates(trainNo);
     var preferred = liveEndpointWinner[trainNo];
@@ -761,6 +843,7 @@
 
       trainState[trainNo].color = color;
       updateDeadReckoning(trainNo, info, cur, target);
+      tryGpsFix(trainNo, color); // async: overrides the estimate above with real coords if this train reports GPS
 
       if(glideLines[trainNo]) map.removeLayer(glideLines[trainNo]);
       if(target){
