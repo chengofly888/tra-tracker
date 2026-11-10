@@ -776,21 +776,41 @@
   }
   function fetchTimetable(trainNo){
     var cands = timetableCandidates(trainNo);
-    var lastRaw = null;
+    var attempts = []; // {url, status, body} for every candidate tried, for debugging
     function attempt(k){
       if(k >= cands.length){
         var e = new Error("timetable_not_found");
-        e.raw = lastRaw;
+        e.attempts = attempts;
         return Promise.reject(e);
       }
-      return authedFetch(cands[k]).then(function(res){
-        if(!res.ok) return attempt(k+1);
-        return res.json().then(function(data){
+      var url = cands[k];
+      return authedFetch(url).then(function(res){
+        if(!res.ok){
+          return res.text().then(function(txt){
+            attempts.push({url:url, status:res.status, body:(txt||"").slice(0,300)});
+            return attempt(k+1);
+          }).catch(function(){
+            attempts.push({url:url, status:res.status, body:"(no body)"});
+            return attempt(k+1);
+          });
+        }
+        return res.text().then(function(txt){
+          var data;
+          try{ data = JSON.parse(txt); }catch(e){
+            attempts.push({url:url, status:res.status, body:"(invalid JSON) " + txt.slice(0,200)});
+            return attempt(k+1);
+          }
           var stops = extractTimetableStops(data);
-          if(!stops){ lastRaw = data; return attempt(k+1); }
+          if(!stops){
+            attempts.push({url:url, status:res.status, body:txt.slice(0,300)});
+            return attempt(k+1);
+          }
           return stops;
-        }).catch(function(){ return attempt(k+1); });
-      }).catch(function(){ return attempt(k+1); });
+        });
+      }).catch(function(err){
+        attempts.push({url:url, status:"fetch_error", body:String(err && err.message || err)});
+        return attempt(k+1);
+      });
     }
     return attempt(0);
   }
@@ -808,10 +828,14 @@
       st.timetableFetching = false;
       st.timetableFailed = true;
       log("車次 " + trainNo + "：時刻表查詢失敗（" + err.message + "），光點將只在到站時跳動，無法平滑移動。", "err");
-      if(err.raw){
+      if(err.attempts && err.attempts.length){
         try{
-          log("車次 " + trainNo + " 時刻表原始資料：<br><span style=\"word-break:break-all;color:#8fa0b5;\">" +
-              JSON.stringify(err.raw).replace(/</g,"&lt;").slice(0,1500) + "</span>", "err");
+          var esc = function(s){ return String(s).replace(/</g,"&lt;"); };
+          var lines = err.attempts.map(function(a){
+            return esc(a.url) + " → HTTP " + esc(a.status) + "：" + esc(a.body);
+          }).join("<br>");
+          log("車次 " + trainNo + " 每個時刻表端點的嘗試結果：<br><span style=\"word-break:break-all;color:#8fa0b5;\">" +
+              lines + "</span>", "err");
         }catch(e){}
       }
     });
