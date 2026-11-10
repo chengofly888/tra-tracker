@@ -714,6 +714,9 @@
     var n = encodeURIComponent(trainNo);
     var d = todayStr();
     return [
+      // confirmed-shape endpoint: today's timetable for a single train number
+      BASE + "/v2/Rail/TRA/DailyTrainTimetable/Today/TrainNo/" + n + "?$format=JSON",
+      BASE + "/v3/Rail/TRA/DailyTrainTimetable/Today/TrainNo/" + n + "?$format=JSON",
       BASE + "/v3/Rail/TRA/DailyTrainTimetable/TrainDate/" + d + "/TrainNo/" + n + "?$format=JSON",
       BASE + "/v2/Rail/TRA/DailyTrainTimetable/TrainDate/" + d + "/TrainNo/" + n + "?$format=JSON",
       BASE + "/v3/Rail/TRA/GeneralTrainTimetable/TrainNo/" + n + "?$format=JSON",
@@ -734,6 +737,16 @@
         var arrProp = Object.keys(data).filter(function(k){ return Array.isArray(data[k]); })[0];
         if(arrProp) arr = data[arrProp];
       }
+    }
+    // confirmed real shape: [{ TrainInfo:{...}, StopTimes:[...] }] or
+    // [{ TrainInfo:{..., StopTimes:[...]} }] — StopTimes sits one level
+    // down inside each array element (sibling of or nested in TrainInfo),
+    // not directly on the element itself, so the generic one-level search
+    // above misses it. Check that specific, confirmed-working shape first.
+    if(arr && arr.length && !pick(arr[0], ["StationID"])){
+      var el = arr[0];
+      if(Array.isArray(el.StopTimes)) arr = el.StopTimes;
+      else if(el.TrainInfo && Array.isArray(el.TrainInfo.StopTimes)) arr = el.TrainInfo.StopTimes;
     }
     if(!arr || !arr.length) return null;
     // the array might be one-element-per-train, each holding its own nested stop list
