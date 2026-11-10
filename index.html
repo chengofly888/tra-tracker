@@ -161,8 +161,11 @@
   // Rail line geometry (polyline shape) and per-line station mileage, both
   // return every line in one call (no path parameter) per TDX's own API
   // client source — no need to know a line's code ahead of time.
-  var SHAPE_URL = BASE + "/v2/Rail/TRA/Shape?$format=JSON";
-  var STATION_OF_LINE_URL = BASE + "/v2/Rail/TRA/StationOfLine?$format=JSON";
+  // Explicit $top: without it, only 2 of TRA's ~20 lines came back from
+  // Shape in live testing (TDX default page size), silently leaving most
+  // stations with no curved-track/mileage data at all.
+  var SHAPE_URL = BASE + "/v2/Rail/TRA/Shape?$format=JSON&$top=1000";
+  var STATION_OF_LINE_URL = BASE + "/v2/Rail/TRA/StationOfLine?$format=JSON&$top=1000";
 
   // ---------- hazard zones (slope/rockfall watch sections) ----------
   // Track mileage (K-marks) along the named line; line name must match the
@@ -177,6 +180,13 @@
   function liveCandidates(trainNo){
     var n = encodeURIComponent(trainNo);
     return [
+      // v3's per-train endpoint first: confirmed real path (TDX's own API
+      // client source) AND the only shape that carries TrainStationStatus
+      // (0=進站中/1=在站上/2=已離站) -- without it we can't tell whether
+      // StationID is where the train actually is or just the stop it's
+      // approaching, which was causing the dot to read a station ahead of
+      // the train's real position.
+      BASE + "/v3/Rail/TRA/TrainLiveBoard/TrainNo/" + n + "?$format=JSON",
       BASE + "/v2/Rail/TRA/TrainLiveBoard/TrainNo/" + n + "?$format=JSON",
       BASE + "/v2/Rail/TRA/TrainLiveBoard?$filter=TrainNo%20eq%20'" + n + "'&$format=JSON",
       BASE + "/v3/Rail/TRA/TrainLiveBoard?$filter=TrainNo%20eq%20'" + n + "'&$format=JSON",
@@ -848,6 +858,7 @@
   }
 
   function parseRow(row){
+    var statusRaw = pick(row, ["TrainStationStatus"]);
     return {
       stationId: String(pick(row, ["StationID","TrainStationID","NowStationID"]) || ""),
       stationName: zh(pick(row, ["StationName","TrainStationName","NowStationName"])),
@@ -856,7 +867,12 @@
       endingStationName: zh(pick(row, ["EndingStationName"])),
       delay: pick(row, ["DelayTime","Delay"]) || 0,
       updateTime: pick(row, ["UpdateTime","SrcUpdateTime"]) || "",
-      direction: pick(row, ["Direction"])
+      direction: pick(row, ["Direction"]),
+      // 列車目前所在之車站狀態: 0=進站中(尚未抵達，StationID是即將停靠的下一站)，
+      // 1=在站上，2=已離站(StationID是最近已停靠/離開的站) -- only present on
+      // the v3 TrainLiveBoard endpoint; v2 (and some train types) omit it.
+      stationStatus: (statusRaw === null || statusRaw === undefined) ? null : parseInt(statusRaw, 10),
+      scheduledArrival: pick(row, ["ScheduledArrivalTime"]) || null
     };
   }
 
@@ -1013,14 +1029,43 @@
   // Returns both the current stop and next stop's full records (so callers
   // can get at departureTime/arrivalTime for schedule-based progress, not
   // just the next station's id).
-  function nextStationFromTimetable(trainNo, currentStationId){
+  // The live board's reported StationID is NOT always "where the train is
+  // right now" -- confirmed from real-world testing: with TrainStationStatus
+  // available (v3 endpoint), 0 means 進站中 (still approaching -- StationID
+  // is the UPCOMING stop, not the current one), 1/2 mean 在站上/已離站
+  // (StationID genuinely is/was the current stop). Without that field (v2
+  // fallback), fall back to comparing now-vs-ScheduledArrivalTime: a
+  // scheduled arrival still in the future means the train hasn't actually
+  // reached that station yet either. Getting this wrong was making the dot
+  // sit a whole station ahead of the train's real position.
+  // Returns {curStop, nextStop, id, arrivalTime} using the resolved pair
+  // (curStop = station just departed/at; nextStop = the one being approached).
+  function resolveCurrentAndNext(trainNo, info){
     var st = trainState[trainNo];
     if(!st.timetableStations) return null;
     var stops = st.timetableStations;
     var idx = -1;
-    for(var i=0;i<stops.length;i++){ if(stops[i].id === currentStationId){ idx = i; break; } }
-    if(idx < 0 || idx+1 >= stops.length) return null;
-    return {id: stops[idx+1].id, arrivalTime: stops[idx+1].arrivalTime, cur: stops[idx], next: stops[idx+1]};
+    for(var i=0;i<stops.length;i++){ if(stops[i].id === info.stationId){ idx = i; break; } }
+    if(idx < 0) return null;
+
+    var arrived;
+    if(info.stationStatus === 1 || info.stationStatus === 2){
+      arrived = true;
+    } else if(info.stationStatus === 0){
+      arrived = false;
+    } else {
+      var schedMs = hmsToMs(info.scheduledArrival);
+      if(schedMs != null){
+        arrived = (Date.now() >= schedMs + (info.delay||0)*60000 - 60000); // 60s slack
+      } else {
+        arrived = true; // no evidence either way -- keep the old assumption
+      }
+    }
+
+    var curIdx = arrived ? idx : idx - 1;
+    var nextIdx = arrived ? idx + 1 : idx;
+    if(curIdx < 0 || nextIdx >= stops.length) return null;
+    return {curStop: stops[curIdx], nextStop: stops[nextIdx], id: stops[nextIdx].id, arrivalTime: stops[nextIdx].arrivalTime};
   }
 
   // Converts a TDX "HH:mm:ss" (or "HH:mm") time-of-day string to an epoch ms
@@ -1063,8 +1108,8 @@
       var info = parseRow(rows[0]);
       updateTrainCard(trainNo, info, color, null, false, false, rows[0], false);
 
-      var cur = stationById[info.stationId];
-      if(!cur){
+      var reportedStation = stationById[info.stationId];
+      if(!reportedStation){
         log("車次 " + trainNo + "：目前站點座標查無資料（StationID=\"" + info.stationId + "\"）。", "err");
         // debug aid: TDX's exact field names for this endpoint are not guaranteed,
         // so surface the raw row once so the real keys can be read off and the
@@ -1078,9 +1123,15 @@
         return;
       }
       ensureTimetable(trainNo);
-      var next = nextStationFromTimetable(trainNo, info.stationId);
-      var target = next ? (stationById[next.id] || null) : null;
-      var nextArrival = next ? next.arrivalTime : null;
+      var resolved = resolveCurrentAndNext(trainNo, info);
+      // cur = the station the train has actually reached/departed (not
+      // necessarily info.stationId -- see resolveCurrentAndNext above).
+      // Falls back to the raw reported station only when resolution isn't
+      // possible yet (timetable still loading, or station not on this run).
+      var cur = resolved ? (stationById[resolved.curStop.id] || reportedStation) : reportedStation;
+      var curName = resolved ? (stationById[resolved.curStop.id] ? stationById[resolved.curStop.id].name : null) : null;
+      var target = resolved ? (stationById[resolved.id] || null) : null;
+      var nextArrival = resolved ? resolved.arrivalTime : null;
 
       trainState[trainNo].color = color;
       updateDeadReckoning(trainNo, info, cur, target);
@@ -1092,9 +1143,9 @@
       // glide above when either is missing (e.g. different lines meeting
       // at a junction, or this leg's times didn't parse).
       trainState[trainNo].scheduleWindow = null;
-      if(target && cur){
-        var seg = buildTrackSegment(info.stationId, next.id, cur, target);
-        var win = seg ? computeScheduleWindow(next.cur, next.next, info.delay) : null;
+      if(resolved && target && cur){
+        var seg = buildTrackSegment(resolved.curStop.id, resolved.id, cur, target);
+        var win = seg ? computeScheduleWindow(resolved.curStop, resolved.nextStop, info.delay) : null;
         if(seg && win){
           trainState[trainNo].scheduleWindow = {
             depMs: win.depMs, arrMs: win.arrMs,
@@ -1117,7 +1168,7 @@
       updateTrainCard(trainNo, info, color, cur, false, false, rows[0], !!target, target, nextArrival);
       log("車次 " + trainNo + " 更新：" + (cur.name||info.stationId) +
           "，誤點 " + (info.delay||0) + " 分。" +
-          (target ? "（下一站：" + (target.name||next.id) + (nextArrival ? "，預計到站 " + nextArrival : "") + "）" : ""), "ok");
+          (target ? "（下一站：" + (target.name||resolved.id) + (nextArrival ? "，預計到站 " + nextArrival : "") + "）" : ""), "ok");
     }).catch(function(err){
       if(err.message === "no_live_data"){
         log("車次 " + trainNo + " 目前查無即時資料（可能尚未發車、已抵達終點，或今天沒有這個班次）。", "err");
@@ -1176,7 +1227,7 @@
       ('<div class="meta">所在路線：'+st.lastLineName+' ・ 軌道里程：K'+st.lastKm.toFixed(1)+'</div>') : "";
     el.innerHTML =
       '<div class="no"><span class="pulse" style="--c:'+color+'"></span>車次 '+trainNo+'</div>' +
-      '<div class="st">目前位置：'+ (info.stationName || stationObj && stationObj.name || info.stationId || "未知") +
+      '<div class="st">目前位置：'+ (stationObj && stationObj.name || info.stationName || info.stationId || "未知") +
       '<span class="delay '+delayCls+'">'+delayTxt+'</span></div>' +
       '<div class="meta">'+nextTxt+'</div>' +
       '<div class="meta">終點：'+(info.endingStationName||"—")+' ・ 更新時間：'+(info.updateTime||"—")+'</div>' +
