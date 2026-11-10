@@ -616,6 +616,121 @@
     };
   }
 
+  // ---------- timetable (to derive "next station" ourselves) ----------
+  // Confirmed from real device testing: TDX's live-board row for this train
+  // type carries NO next-station field at all (just TrainNo/StationID/
+  // StationName/DelayTime/UpdateTime/...). So "next station" has to be
+  // worked out from the train's own stop sequence: fetch its timetable
+  // once, find where the currently-reported station sits in that ordered
+  // list, and the next entry is the next station.
+  function todayStr(){
+    var d = new Date();
+    var pad = function(n){ return n < 10 ? "0"+n : ""+n; };
+    return d.getFullYear() + "-" + pad(d.getMonth()+1) + "-" + pad(d.getDate());
+  }
+  function timetableCandidates(trainNo){
+    var n = encodeURIComponent(trainNo);
+    var d = todayStr();
+    return [
+      BASE + "/v3/Rail/TRA/DailyTrainTimetable/TrainDate/" + d + "/TrainNo/" + n + "?$format=JSON",
+      BASE + "/v2/Rail/TRA/DailyTrainTimetable/TrainDate/" + d + "/TrainNo/" + n + "?$format=JSON",
+      BASE + "/v3/Rail/TRA/GeneralTrainTimetable/TrainNo/" + n + "?$format=JSON",
+      BASE + "/v2/Rail/TRA/TrainTimetable/TrainDate/" + d + "/TrainNo/" + n + "?$format=JSON"
+    ];
+  }
+  // Unwraps whatever shape the timetable endpoint answers with down to a
+  // flat array of stop rows, trying a few likely wrapper/nesting patterns.
+  function extractTimetableStops(data){
+    var arr = null;
+    if(Array.isArray(data)) arr = data;
+    else if(data && typeof data === "object"){
+      var wrapKeys = ["TrainStopTimes","StopTimes","TimetableTrainInfos","TrainTimetables","StationStopTimes","TrainStationStopTimes"];
+      for(var i=0;i<wrapKeys.length;i++){
+        if(Array.isArray(data[wrapKeys[i]])){ arr = data[wrapKeys[i]]; break; }
+      }
+      if(!arr){
+        var arrProp = Object.keys(data).filter(function(k){ return Array.isArray(data[k]); })[0];
+        if(arrProp) arr = data[arrProp];
+      }
+    }
+    if(!arr || !arr.length) return null;
+    // the array might be one-element-per-train, each holding its own nested stop list
+    if(!pick(arr[0], ["StationID"])){
+      var nestedKey = Object.keys(arr[0]).filter(function(k){ return Array.isArray(arr[0][k]); })[0];
+      if(nestedKey) arr = arr[0][nestedKey];
+    }
+    if(!arr || !arr.length) return null;
+    var stops = arr.map(function(row, i){
+      var sid = pick(row, ["StationID"]);
+      if(sid === undefined){
+        var inner = pick(row, ["StopStation","Station"]);
+        sid = inner ? pick(inner, ["StationID"]) : undefined;
+      }
+      return {
+        id: String(sid || ""),
+        seq: pick(row, ["StopSequence","Sequence","StationSequence"]),
+        order: i
+      };
+    }).filter(function(s){ return s.id; });
+    if(!stops.length) return null;
+    stops.sort(function(a,b){
+      if(a.seq != null && b.seq != null) return a.seq - b.seq;
+      return a.order - b.order;
+    });
+    return stops;
+  }
+  function fetchTimetable(trainNo){
+    var cands = timetableCandidates(trainNo);
+    var lastRaw = null;
+    function attempt(k){
+      if(k >= cands.length){
+        var e = new Error("timetable_not_found");
+        e.raw = lastRaw;
+        return Promise.reject(e);
+      }
+      return authedFetch(cands[k]).then(function(res){
+        if(!res.ok) return attempt(k+1);
+        return res.json().then(function(data){
+          var stops = extractTimetableStops(data);
+          if(!stops){ lastRaw = data; return attempt(k+1); }
+          return stops;
+        }).catch(function(){ return attempt(k+1); });
+      }).catch(function(){ return attempt(k+1); });
+    }
+    return attempt(0);
+  }
+  // Kicks off the timetable fetch once per train and caches the result
+  // (or the failure) on trainState so pollOne can just read it back.
+  function ensureTimetable(trainNo){
+    var st = trainState[trainNo];
+    if(st.timetableStations || st.timetableFetching || st.timetableFailed) return;
+    st.timetableFetching = true;
+    fetchTimetable(trainNo).then(function(stops){
+      st.timetableStations = stops;
+      st.timetableFetching = false;
+      log("車次 " + trainNo + "：時刻表載入成功，共 " + stops.length + " 站，之後可推算下一站。", "ok");
+    }).catch(function(err){
+      st.timetableFetching = false;
+      st.timetableFailed = true;
+      log("車次 " + trainNo + "：時刻表查詢失敗（" + err.message + "），光點將只在到站時跳動，無法平滑移動。", "err");
+      if(err.raw){
+        try{
+          log("車次 " + trainNo + " 時刻表原始資料：<br><span style=\"word-break:break-all;color:#8fa0b5;\">" +
+              JSON.stringify(err.raw).replace(/</g,"&lt;").slice(0,1500) + "</span>", "err");
+        }catch(e){}
+      }
+    });
+  }
+  function nextStationFromTimetable(trainNo, currentStationId){
+    var st = trainState[trainNo];
+    if(!st.timetableStations) return null;
+    var stops = st.timetableStations;
+    var idx = -1;
+    for(var i=0;i<stops.length;i++){ if(stops[i].id === currentStationId){ idx = i; break; } }
+    if(idx < 0 || idx+1 >= stops.length) return null;
+    return stops[idx+1].id;
+  }
+
   function pollOne(trainNo, color){
     return tryLiveEndpoints(trainNo).then(function(rows){
       rows.sort(function(a,b){
@@ -640,18 +755,10 @@
         }catch(e){}
         return;
       }
-      var target = stationById[info.nextStationId] || null;
-      if(!target && !trainState[trainNo].loggedNoTargetDebug){
-        trainState[trainNo].loggedNoTargetDebug = true;
-        log("車次 " + trainNo + "：查無「下一站」資料（猜測欄位值=\"" + info.nextStationId +
-            "\"），光點暫時無法推算移動方向。", "err");
-        try{
-          log("車次 " + trainNo + " 原始資料欄位：" + Object.keys(rows[0]).join(", "), "err");
-          var rawNT = JSON.stringify(rows[0]);
-          log("車次 " + trainNo + " 原始 JSON：<br><span style=\"word-break:break-all;color:#8fa0b5;\">" +
-              rawNT.replace(/</g,"&lt;").slice(0,1500) + "</span>", "err");
-        }catch(eNT){}
-      }
+      ensureTimetable(trainNo);
+      var nextId = nextStationFromTimetable(trainNo, info.stationId);
+      var target = nextId ? (stationById[nextId] || null) : null;
+
       trainState[trainNo].color = color;
       updateDeadReckoning(trainNo, info, cur, target);
 
