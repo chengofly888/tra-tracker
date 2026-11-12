@@ -89,13 +89,7 @@
     70%{box-shadow:0 0 0 8px transparent}100%{box-shadow:0 0 0 0 transparent}}
   .train-dot{border-radius:50%;border:2px solid #fff;box-shadow:0 0 6px rgba(0,0,0,.5);
     display:flex;align-items:center;justify-content:center;color:#fff;font-family:var(--mono);
-    font-weight:800;font-size:10px;}
-  .train-dot.hazard{background:#e3253b !important;animation:hazardBlink 0.9s infinite;}
-  @keyframes hazardBlink{0%{box-shadow:0 0 6px rgba(227,37,59,.9),0 0 0 0 rgba(227,37,59,.8);}
-    70%{box-shadow:0 0 6px rgba(227,37,59,.9),0 0 0 14px rgba(227,37,59,0);}
-    100%{box-shadow:0 0 6px rgba(227,37,59,.9),0 0 0 0 rgba(227,37,59,0);}}
-  .hazard-banner{margin-top:6px;padding:6px 8px;border-radius:7px;font-size:12px;font-weight:700;
-    background:#3a0b10;color:#ff8a93;border:1px solid #e3253b;}
+    font-weight:800;font-size:10px;transition:left .9s linear, top .9s linear;}
   .leaflet-container{background:#0a0e14;}
   @media (max-width:760px){
     #layout{flex-direction:column;}
@@ -158,35 +152,12 @@
   var AUTH_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token";
   var BASE = "https://tdx.transportdata.tw/api/basic";
   var STATION_URL = BASE + "/v2/Rail/TRA/Station?$format=JSON";
-  // Rail line geometry (polyline shape) and per-line station mileage, both
-  // return every line in one call (no path parameter) per TDX's own API
-  // client source — no need to know a line's code ahead of time.
-  // Explicit $top: without it, only 2 of TRA's ~20 lines came back from
-  // Shape in live testing (TDX default page size), silently leaving most
-  // stations with no curved-track/mileage data at all.
-  var SHAPE_URL = BASE + "/v2/Rail/TRA/Shape?$format=JSON&$top=1000";
-  var STATION_OF_LINE_URL = BASE + "/v2/Rail/TRA/StationOfLine?$format=JSON&$top=1000";
-
-  // ---------- hazard zones (slope/rockfall watch sections) ----------
-  // Track mileage (K-marks) along the named line; line name must match the
-  // Shape API's LineName.Zh_tw exactly. Add more sections here as needed.
-  var HAZARD_ZONES = [
-    { id: "HZ-01", name: "和仁-崇德落石易發段", line: "北迴線", startKm: 48.5, endKm: 51.2, riskLevel: "HIGH" },
-    { id: "HZ-02", name: "猴硐-三貂嶺邊坡段", line: "宜蘭線", startKm: 12.0, endKm: 13.5, riskLevel: "WARNING" }
-  ];
   // Candidate live-position endpoints, tried in order per train until one works.
   // TDX's live train-position dataset has been served under a couple of different
   // path/version spellings over time, so we probe them instead of hardcoding one.
   function liveCandidates(trainNo){
     var n = encodeURIComponent(trainNo);
     return [
-      // v3's per-train endpoint first: confirmed real path (TDX's own API
-      // client source) AND the only shape that carries TrainStationStatus
-      // (0=進站中/1=在站上/2=已離站) -- without it we can't tell whether
-      // StationID is where the train actually is or just the stop it's
-      // approaching, which was causing the dot to read a station ahead of
-      // the train's real position.
-      BASE + "/v3/Rail/TRA/TrainLiveBoard/TrainNo/" + n + "?$format=JSON",
       BASE + "/v2/Rail/TRA/TrainLiveBoard/TrainNo/" + n + "?$format=JSON",
       BASE + "/v2/Rail/TRA/TrainLiveBoard?$filter=TrainNo%20eq%20'" + n + "'&$format=JSON",
       BASE + "/v3/Rail/TRA/TrainLiveBoard?$filter=TrainNo%20eq%20'" + n + "'&$format=JSON",
@@ -194,12 +165,7 @@
     ];
   }
   var COLORS = ["#ff7a1a","#3ecf8e","#4da6ff","#ff5d9e","#ffd23f"];
-  // TDX's own response tells us how often ITS data actually refreshes: the
-  // envelope carries UpdateInterval:30 (seconds), so match that exactly —
-  // polling faster just re-fetches an unchanged reading. The illusion of
-  // continuous motion between those real updates comes from the
-  // dead-reckoning glide below, not from polling faster than the source.
-  var POLL_MS = 30000;
+  var POLL_MS = 25000;
   var MAX_TRAINS = 5;
   var MAX_KEYS = 5;
 
@@ -207,11 +173,6 @@
   var keyWorkingIndex = 0;      // which key slot currently works, by DOM position
   var token = null, tokenExpiry = 0;
   var stationById = {};         // StationID -> {name, lat, lon}
-  var lineShapes = {};          // LineID -> [{lat,lon}, ...] polyline vertices, in Shape's original order
-  var lineNames = {};           // LineID -> Chinese line name (matches HAZARD_ZONES[].line)
-  var lineStations = {};        // LineID -> { StationID -> kmMark }
-  var stationToLine = {};       // StationID -> LineID (first line found containing it)
-  var railGeometryLoaded = false;
   var liveEndpointWinner = {};  // trainNo -> url template index that worked last time
   var trainState = {};          // trainNo -> {stationId, nextStationId, delay, updateTime, marker, ...}
   var pollTimer = null;
@@ -383,107 +344,16 @@
     return m;
   }
 
-  // ---------- dead-reckoning between polls ----------
-  // TDX only tells us which station a train is at (or last reported) every
-  // ~25-60s; it gives no continuous GPS. To avoid the dot sitting still and
-  // then jumping, we estimate the train's speed from how fast it actually
-  // covered the previous station-to-station segment, then keep sliding the
-  // dot toward the next station at that estimated pace every animation
-  // frame, in between polls. A fresh poll either confirms arrival (resets
-  // the segment and refines the speed estimate) or, if the train is still
-  // between the same two stations, just lets the existing glide continue.
-  var EARTH_R = 6371000;
-  var DEFAULT_SPEED_MPS = 16.7;      // ~60km/h, used only until a real segment is measured
-  var MIN_SPEED_MPS = 3;             // ~11km/h floor
-  var MAX_SPEED_MPS = 42;            // ~150km/h ceiling, generous for TRA
-  var MAX_SEGMENT_FRACTION = 0.97;   // never let the dot reach the next station on its own; a poll must confirm it
-
-  function haversineMeters(a, b){
-    var toRad = function(d){ return d * Math.PI / 180; };
-    var dLat = toRad(b.lat - a.lat), dLon = toRad(b.lon - a.lon);
-    var lat1 = toRad(a.lat), lat2 = toRad(b.lat);
-    var h = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)*Math.sin(dLon/2);
-    return 2 * EARTH_R * Math.asin(Math.min(1, Math.sqrt(h)));
-  }
-
-  // Called whenever a poll confirms a station fix. Decides whether this is
-  // a new segment (station advanced -> measure real speed from the last
-  // segment) or the same segment continuing (just let the glide keep going).
-  function updateDeadReckoning(trainNo, info, cur, target){
-    var st = trainState[trainNo];
-    var nowT = Date.now();
-    if(!st.segStart){
-      st.lastConfirmedStationId = info.stationId;
-      st.segStart = {lat: cur.lat, lon: cur.lon, t: nowT};
-      st.segEnd = target ? {lat: target.lat, lon: target.lon} : {lat: cur.lat, lon: cur.lon};
-      st.estSpeedMps = DEFAULT_SPEED_MPS;
-      ensureMarker(trainNo, st.color).setLatLng([cur.lat, cur.lon]);
-      return;
+  function animateMarkerTo(marker, fromLatLng, toLatLng, ms){
+    var start = performance.now();
+    function step(ts){
+      var p = Math.min(1, (ts-start)/ms);
+      var lat = fromLatLng[0] + (toLatLng[0]-fromLatLng[0])*p;
+      var lon = fromLatLng[1] + (toLatLng[1]-fromLatLng[1])*p;
+      marker.setLatLng([lat, lon]);
+      if(p < 1) requestAnimationFrame(step);
     }
-    if(info.stationId !== st.lastConfirmedStationId){
-      // station advanced since the last poll: measure how fast it actually
-      // covered that ground and fold it into the speed estimate (smoothed,
-      // so one noisy reading doesn't swing the pace wildly)
-      var elapsedSec = Math.max(1, (nowT - st.segStart.t) / 1000);
-      var distM = haversineMeters(st.segStart, {lat: cur.lat, lon: cur.lon});
-      var measured = distM / elapsedSec;
-      var blended = st.estSpeedMps ? (st.estSpeedMps * 0.4 + measured * 0.6) : measured;
-      st.estSpeedMps = Math.min(MAX_SPEED_MPS, Math.max(MIN_SPEED_MPS, blended));
-      st.lastConfirmedStationId = info.stationId;
-      st.segStart = {lat: cur.lat, lon: cur.lon, t: nowT};
-      st.segEnd = target ? {lat: target.lat, lon: target.lon} : {lat: cur.lat, lon: cur.lon};
-    } else if(target){
-      // same segment still in progress: just keep the existing glide's
-      // start time/speed as-is, but refresh the target in case the
-      // "next station" field itself changed (e.g. direction correction)
-      st.segEnd = {lat: target.lat, lon: target.lon};
-    }
-  }
-
-  var rafRunning = false;
-  function driveDeadReckoning(){
-    Object.keys(trainState).forEach(function(no){
-      var st = trainState[no];
-      if(!st || !st.marker) return;
-      var win = st.scheduleWindow;
-      if(win){
-        // Preferred path: real schedule times + real track geometry. No
-        // speed estimate needed -- progress through the depMs..arrMs
-        // window IS the position, recomputed fresh every frame straight
-        // from the wall clock, then walked along the actual polyline by
-        // arc length (never a straight lat/lon lerp between the stations).
-        var frac = (Date.now() - win.depMs) / (win.arrMs - win.depMs);
-        frac = Math.max(0, Math.min(1, frac));
-        var pt = pointAtArcLengthFraction(win.subCoords, frac);
-        st.marker.setLatLng([pt.lat, pt.lon]);
-        var km = win.kmCur + (win.kmNext - win.kmCur) * frac;
-        st.lastKm = km;
-        st.lastLineName = win.lineName;
-        applyHazardState(no, findHazardZone(win.lineName, km), km);
-        return;
-      }
-      if(!st.segStart || !st.segEnd) return;
-      // Fallback: no usable schedule/geometry data for this leg (different
-      // lines at a junction, missing timetable, etc) -- plain straight-line
-      // glide at the speed estimated from the train's last real segment.
-      var totalDist = haversineMeters(st.segStart, st.segEnd);
-      if(totalDist < 5){ return; } // already there / no known next station
-      var elapsedSec = (Date.now() - st.segStart.t) / 1000;
-      var traveled = (st.estSpeedMps || DEFAULT_SPEED_MPS) * elapsedSec;
-      var lfrac = Math.min(traveled / totalDist, MAX_SEGMENT_FRACTION);
-      var lat = st.segStart.lat + (st.segEnd.lat - st.segStart.lat) * lfrac;
-      var lon = st.segStart.lon + (st.segEnd.lon - st.segStart.lon) * lfrac;
-      st.marker.setLatLng([lat, lon]);
-    });
-    if(rafRunning) requestAnimationFrame(driveDeadReckoning);
-  }
-  function startDeadReckoning(){
-    if(rafRunning) return;
-    rafRunning = true;
-    requestAnimationFrame(driveDeadReckoning);
-  }
-  function stopDeadReckoning(){
-    rafRunning = false;
+    requestAnimationFrame(step);
   }
 
   // ---------- TDX auth ----------
@@ -566,14 +436,7 @@
     return attempt(0);
   }
 
-  function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
-
-  // TDX enforces a per-key rate limit; a burst of startup calls (station
-  // list + line geometry + per-train live board/timetable) can trip it with
-  // 429s even though each individual call is legitimate. Retry those with
-  // a short backoff instead of treating them as a hard failure.
-  function authedFetch(url, retriesLeft){
-    if(retriesLeft === undefined) retriesLeft = 3;
+  function authedFetch(url){
     return getToken().then(function(tok){
       return fetch(url, {headers: {"Authorization": "Bearer " + tok}});
     }).then(function(res){
@@ -586,11 +449,6 @@
         return getToken().then(function(tok2){
           return fetch(url, {headers:{"Authorization":"Bearer "+tok2}});
         });
-      }
-      if(res.status === 429 && retriesLeft > 0){
-        var waitMs = (4 - retriesLeft) * 1500 + 1000; // 1s, 2.5s, 4s backoff
-        log("TDX 速率限制（429），" + (waitMs/1000) + " 秒後重試…", "err");
-        return sleep(waitMs).then(function(){ return authedFetch(url, retriesLeft - 1); });
       }
       return res;
     });
@@ -621,212 +479,7 @@
     });
   }
 
-  // ---------- rail line geometry + mileage (for curved interpolation & hazard-zone checks) ----------
-  // WKT looks like "LINESTRING (121.123456 25.123456, 121.234567 25.234567, ...)".
-  // WKT coordinate order is (lon, lat) -- opposite of how we store {lat,lon}
-  // everywhere else in this file, so swap on the way in.
-  function parseWktLineString(wkt){
-    if(!wkt || typeof wkt !== "string") return null;
-    var m = wkt.match(/\(\s*([^()]+)\)\s*$/); // last parenthesised group handles LINESTRING and MULTILINESTRING's one segment alike
-    if(!m) return null;
-    var pts = m[1].split(",").map(function(pair){
-      var xy = pair.trim().split(/\s+/);
-      var lon = parseFloat(xy[0]), lat = parseFloat(xy[1]);
-      if(!isFinite(lon) || !isFinite(lat)) return null;
-      return {lat:lat, lon:lon};
-    }).filter(Boolean);
-    return pts.length >= 2 ? pts : null;
-  }
-
-  // Fetches every TRA line's polyline geometry (Shape) and per-station
-  // cumulative mileage (StationOfLine) in one pass each; both endpoints
-  // return ALL lines at once (no per-line path parameter), confirmed from
-  // TDX's own generated API client. Used for: (a) curving the dot along
-  // the real track between two stations instead of a straight line, and
-  // (b) computing the train's track mileage (K-mark) for hazard-zone checks.
-  // Best-effort: if this fails, pollOne/driveDeadReckoning fall back to the
-  // plain straight-line + speed-estimate glide with no mileage/hazard check.
-  function loadRailGeometry(){
-    if(railGeometryLoaded) return Promise.resolve();
-    log("載入軌道線形與里程資料…");
-    // Sequential, not Promise.all: firing every startup call at once is
-    // what was tripping TDX's rate limit (429) even on first use of a
-    // fresh key. A small stagger between calls avoids that burst.
-    return authedFetch(SHAPE_URL).then(function(res){ return res.ok ? res.json() : []; }).catch(function(){ return []; })
-      .then(function(shapeData){
-        return sleep(400).then(function(){ return shapeData; });
-      })
-      .then(function(shapeData){
-        return authedFetch(STATION_OF_LINE_URL).then(function(res){ return res.ok ? res.json() : []; }).catch(function(){ return []; })
-          .then(function(solData){ return [shapeData, solData]; });
-      })
-      .then(function(results){
-      var shapes = Array.isArray(results[0]) ? results[0] : [];
-      var sol = Array.isArray(results[1]) ? results[1] : [];
-      shapes.forEach(function(row){
-        var lineId = String(pick(row, ["LineID"]) || "");
-        var wkt = pick(row, ["Geometry"]);
-        var pts = parseWktLineString(wkt);
-        if(lineId && pts){
-          lineShapes[lineId] = pts;
-          lineNames[lineId] = zh(pick(row, ["LineName"])) || lineId;
-        }
-      });
-      sol.forEach(function(row){
-        var lineId = String(pick(row, ["LineID"]) || "");
-        var stations = pick(row, ["Stations"]);
-        if(!lineId || !Array.isArray(stations)) return;
-        var km = {};
-        stations.forEach(function(s){
-          var sid = String(pick(s, ["StationID"]) || "");
-          var dist = pick(s, ["TraveledDistance"]);
-          if(sid && dist != null){
-            km[sid] = parseFloat(dist);
-            if(stationToLine[sid] === undefined) stationToLine[sid] = lineId;
-          }
-        });
-        lineStations[lineId] = km;
-      });
-      railGeometryLoaded = true;
-      log("軌道線形載入完成，共 " + Object.keys(lineShapes).length + " 條路線（含里程資料 " +
-          Object.keys(lineStations).length + " 條）。", "ok");
-    }).catch(function(err){
-      log("軌道線形資料載入失敗（" + err.message + "），邊坡警戒與沿線曲線移動將停用，僅保留直線估算。", "err");
-    });
-  }
-
-  function nearestPointIndex(coords, latlon){
-    var best = 0, bestD = Infinity;
-    for(var i=0;i<coords.length;i++){
-      var d = haversineMeters(coords[i], latlon);
-      if(d < bestD){ bestD = d; best = i; }
-    }
-    return best;
-  }
-
-  // Cuts the sub-array of a line's polyline between the two stations'
-  // nearest vertices, always ordered current -> next (reversed if the
-  // line's own point order runs the other way for this direction of travel).
-  function sliceLineBetween(coords, aLatLon, bLatLon){
-    var ia = nearestPointIndex(coords, aLatLon);
-    var ib = nearestPointIndex(coords, bLatLon);
-    if(ia === ib) return null;
-    var sub = ia < ib ? coords.slice(ia, ib+1) : coords.slice(ib, ia+1).slice().reverse();
-    return sub.length >= 2 ? sub : null;
-  }
-
-  // Walks a polyline sub-array by real along-track (arc-length) distance --
-  // never a straight-line lerp between the two endpoint stations -- and
-  // returns the point at the given progress fraction (0..1) of its total length.
-  function pointAtArcLengthFraction(subCoords, frac){
-    frac = Math.max(0, Math.min(1, frac));
-    var segLens = [];
-    var total = 0;
-    for(var i=0;i<subCoords.length-1;i++){
-      var d = haversineMeters(subCoords[i], subCoords[i+1]);
-      segLens.push(d);
-      total += d;
-    }
-    if(total <= 0) return subCoords[0];
-    var target = frac * total;
-    var acc = 0;
-    for(var j=0;j<segLens.length;j++){
-      if(acc + segLens[j] >= target || j === segLens.length-1){
-        var segFrac = segLens[j] > 0 ? (target - acc) / segLens[j] : 0;
-        segFrac = Math.max(0, Math.min(1, segFrac));
-        var a = subCoords[j], b = subCoords[j+1];
-        return {lat: a.lat + (b.lat-a.lat)*segFrac, lon: a.lon + (b.lon-a.lon)*segFrac};
-      }
-      acc += segLens[j];
-    }
-    return subCoords[subCoords.length-1];
-  }
-
-  // Builds everything pollOne/driveDeadReckoning need to curve a train
-  // between its current and next station along the real track and derive
-  // its mileage, or null if the geometry/mileage data can't support it
-  // (different lines, missing station in the mileage table, etc).
-  function buildTrackSegment(curStationId, nextStationId, curLatLon, nextLatLon){
-    if(!railGeometryLoaded) return null;
-    var lineId = stationToLine[curStationId] || stationToLine[nextStationId];
-    if(!lineId || !lineShapes[lineId] || !lineStations[lineId]) return null;
-    var kmCur = lineStations[lineId][curStationId];
-    var kmNext = lineStations[lineId][nextStationId];
-    if(kmCur == null || kmNext == null) return null;
-    var sub = sliceLineBetween(lineShapes[lineId], curLatLon, nextLatLon);
-    if(!sub) return null;
-    return {lineId: lineId, lineName: lineNames[lineId] || lineId, subCoords: sub, kmCur: kmCur, kmNext: kmNext};
-  }
-
-  // Finds the hazard zone (if any) a given line+mileage falls inside.
-  function findHazardZone(lineName, km){
-    for(var i=0;i<HAZARD_ZONES.length;i++){
-      var z = HAZARD_ZONES[i];
-      if(z.line !== lineName) continue;
-      var lo = Math.min(z.startKm, z.endKm), hi = Math.max(z.startKm, z.endKm);
-      if(km >= lo && km <= hi) return z;
-    }
-    return null;
-  }
-
-  // Called every time a train's mileage is (re)computed. Flags entry/exit
-  // transitions with a log line and toggles the marker's red-blink state;
-  // returns the currently-active zone (or null) so the caller can show it.
-  function applyHazardState(trainNo, zone, km){
-    var st = trainState[trainNo];
-    var prev = st.activeHazard || null;
-    if(zone && (!prev || prev.id !== zone.id)){
-      log("【警告】車次 " + trainNo + " 已進入 " + zone.id + " " + zone.name +
-          "，目前推估里程 K" + km.toFixed(1) + "（警戒等級：" + zone.riskLevel + "）。", "err");
-    } else if(!zone && prev){
-      log("車次 " + trainNo + " 已駛離 " + prev.id + " " + prev.name + " 警戒區間。", "ok");
-    }
-    st.activeHazard = zone;
-    if(st.marker){
-      var el = st.marker.getElement && st.marker.getElement();
-      var dot = el && el.querySelector && el.querySelector(".train-dot");
-      if(dot) dot.classList.toggle("hazard", !!zone);
-    }
-    // Runs every animation frame (far more often than the card's own 30s
-    // poll-driven redraw), so keep the card's hazard banner in sync here
-    // too -- otherwise it'd only reflect whatever was true at the last poll.
-    var card = $("card_" + trainNo);
-    if(card){
-      var banner = card.querySelector(".hazard-banner");
-      if(zone){
-        if(!banner){
-          banner = document.createElement("div");
-          banner.className = "hazard-banner";
-          card.appendChild(banner);
-        }
-        banner.textContent = "【警告】已進入 " + zone.id + " " + zone.name +
-          "（" + zone.riskLevel + "）・目前里程 K" + km.toFixed(1);
-      } else if(banner){
-        banner.remove();
-      }
-    }
-    return zone;
-  }
-
   // ---------- live position polling ----------
-  // TDX wraps several of its rail endpoints in an envelope object
-  // ({UpdateTime, ..., TrainLiveBoards:[...]}) rather than returning a bare
-  // array, and the wrapper's array key varies by endpoint/version. Unwrap
-  // whichever shape comes back instead of assuming one.
-  function extractRows(data){
-    if(Array.isArray(data)) return data;
-    if(!data || typeof data !== "object") return [];
-    var wrapKeys = ["TrainLiveBoards","LiveBoards","TrainLiveBoard","LiveBoard","TrainLiveBoardList"];
-    for(var i=0;i<wrapKeys.length;i++){
-      if(Array.isArray(data[wrapKeys[i]])) return data[wrapKeys[i]];
-    }
-    // a handful of endpoints return one row as a bare object with no wrapper
-    if(data.TrainNo !== undefined || data.StationID !== undefined || data.TrainStationID !== undefined){
-      return [data];
-    }
-    return [];
-  }
-
   function tryLiveEndpoints(trainNo){
     var cands = liveCandidates(trainNo);
     var preferred = liveEndpointWinner[trainNo];
@@ -834,21 +487,14 @@
     if(preferred !== undefined){
       order = [preferred].concat(order.filter(function(i){return i!==preferred;}));
     }
-    var sawEmptyBoard = false; // endpoint answered fine, just no active train right now
     function attempt(k){
-      if(k >= order.length){
-        var e = new Error(sawEmptyBoard ? "no_live_data" : "no_endpoint_worked");
-        return Promise.reject(e);
-      }
+      if(k >= order.length) return Promise.reject(new Error("no_endpoint_worked"));
       var idx = order[k];
       return authedFetch(cands[idx]).then(function(res){
         if(!res.ok) return attempt(k+1);
         return res.json().then(function(data){
-          var rows = extractRows(data);
-          if(rows.length === 0){
-            if(data && typeof data === "object" && !Array.isArray(data)) sawEmptyBoard = true;
-            return attempt(k+1);
-          }
+          var rows = Array.isArray(data) ? data : (data ? [data] : []);
+          if(rows.length === 0) return attempt(k+1);
           liveEndpointWinner[trainNo] = idx;
           return rows;
         }).catch(function(){ return attempt(k+1); });
@@ -858,7 +504,6 @@
   }
 
   function parseRow(row){
-    var statusRaw = pick(row, ["TrainStationStatus"]);
     return {
       stationId: String(pick(row, ["StationID","TrainStationID","NowStationID"]) || ""),
       stationName: zh(pick(row, ["StationName","TrainStationName","NowStationName"])),
@@ -867,235 +512,8 @@
       endingStationName: zh(pick(row, ["EndingStationName"])),
       delay: pick(row, ["DelayTime","Delay"]) || 0,
       updateTime: pick(row, ["UpdateTime","SrcUpdateTime"]) || "",
-      direction: pick(row, ["Direction"]),
-      // 列車目前所在之車站狀態: 0=進站中(尚未抵達，StationID是即將停靠的下一站)，
-      // 1=在站上，2=已離站(StationID是最近已停靠/離開的站) -- only present on
-      // the v3 TrainLiveBoard endpoint; v2 (and some train types) omit it.
-      stationStatus: (statusRaw === null || statusRaw === undefined) ? null : parseInt(statusRaw, 10),
-      scheduledArrival: pick(row, ["ScheduledArrivalTime"]) || null
+      direction: pick(row, ["Direction"])
     };
-  }
-
-  // ---------- timetable (to derive "next station" ourselves) ----------
-  // Confirmed from real device testing: TDX's live-board row for this train
-  // type carries NO next-station field at all (just TrainNo/StationID/
-  // StationName/DelayTime/UpdateTime/...). So "next station" has to be
-  // worked out from the train's own stop sequence: fetch its timetable
-  // once, find where the currently-reported station sits in that ordered
-  // list, and the next entry is the next station.
-  function todayStr(){
-    var d = new Date();
-    var pad = function(n){ return n < 10 ? "0"+n : ""+n; };
-    return d.getFullYear() + "-" + pad(d.getMonth()+1) + "-" + pad(d.getDate());
-  }
-  // The endpoint family is "DailyTimetable" (NOT "DailyTrainTimetable" --
-  // that path never existed, which is why every earlier guess 404'd).
-  // Confirmed against TDX's own generated API client source
-  // (github.com/minchao/go-ptx, rail/v2/client/t_r_a/tra_client.go):
-  //   GET /v2/Rail/TRA/DailyTimetable/Today/TrainNo/{TrainNo}
-  //   GET /v2/Rail/TRA/DailyTimetable/TrainNo/{TrainNo}/TrainDate/{TrainDate}   (note: TrainNo before TrainDate)
-  //   GET /v2/Rail/TRA/GeneralTimetable/TrainNo/{TrainNo}                      (regular/undated schedule, always available as a last resort)
-  function timetableCandidates(trainNo){
-    var n = encodeURIComponent(trainNo);
-    var d = todayStr();
-    return [
-      BASE + "/v2/Rail/TRA/DailyTimetable/Today/TrainNo/" + n + "?$format=JSON",
-      BASE + "/v2/Rail/TRA/DailyTimetable/TrainNo/" + n + "/TrainDate/" + d + "?$format=JSON",
-      BASE + "/v2/Rail/TRA/GeneralTimetable/TrainNo/" + n + "?$format=JSON"
-    ];
-  }
-  // Unwraps whatever shape the timetable endpoint answers with down to a
-  // flat array of stop rows, trying a few likely wrapper/nesting patterns.
-  function extractTimetableStops(data){
-    var arr = null;
-    if(Array.isArray(data)) arr = data;
-    else if(data && typeof data === "object"){
-      var wrapKeys = ["TrainStopTimes","StopTimes","TimetableTrainInfos","TrainTimetables","StationStopTimes","TrainStationStopTimes"];
-      for(var i=0;i<wrapKeys.length;i++){
-        if(Array.isArray(data[wrapKeys[i]])){ arr = data[wrapKeys[i]]; break; }
-      }
-      if(!arr){
-        var arrProp = Object.keys(data).filter(function(k){ return Array.isArray(data[k]); })[0];
-        if(arrProp) arr = data[arrProp];
-      }
-    }
-    // Confirmed real response shapes (from TDX's own API client source):
-    //  - DailyTimetable/*: [{ DailyTrainInfo:{...}, StopTimes:[...], TrainDate, ... }]
-    //    (StopTimes sits directly on the element, sibling of DailyTrainInfo)
-    //  - GeneralTimetable/TrainNo/*: [{ GeneralTimetable:{ GeneralTrainInfo, StopTimes:[...] }, ... }]
-    //    (StopTimes is nested one level down inside GeneralTimetable)
-    if(arr && arr.length && !pick(arr[0], ["StationID"])){
-      var el = arr[0];
-      if(Array.isArray(el.StopTimes)) arr = el.StopTimes;
-      else if(el.GeneralTimetable && Array.isArray(el.GeneralTimetable.StopTimes)) arr = el.GeneralTimetable.StopTimes;
-      else if(el.TrainInfo && Array.isArray(el.TrainInfo.StopTimes)) arr = el.TrainInfo.StopTimes;
-    }
-    if(!arr || !arr.length) return null;
-    // the array might be one-element-per-train, each holding its own nested stop list
-    if(!pick(arr[0], ["StationID"])){
-      var nestedKey = Object.keys(arr[0]).filter(function(k){ return Array.isArray(arr[0][k]); })[0];
-      if(nestedKey) arr = arr[0][nestedKey];
-    }
-    if(!arr || !arr.length) return null;
-    var stops = arr.map(function(row, i){
-      var sid = pick(row, ["StationID"]);
-      if(sid === undefined){
-        var inner = pick(row, ["StopStation","Station"]);
-        sid = inner ? pick(inner, ["StationID"]) : undefined;
-      }
-      return {
-        id: String(sid || ""),
-        seq: pick(row, ["StopSequence","Sequence","StationSequence"]),
-        order: i,
-        arrivalTime: pick(row, ["ArrivalTime","ArriveTime"]) || null,
-        departureTime: pick(row, ["DepartureTime","DepartTime"]) || null
-      };
-    }).filter(function(s){ return s.id; });
-    if(!stops.length) return null;
-    stops.sort(function(a,b){
-      if(a.seq != null && b.seq != null) return a.seq - b.seq;
-      return a.order - b.order;
-    });
-    return stops;
-  }
-  function fetchTimetable(trainNo){
-    var cands = timetableCandidates(trainNo);
-    var attempts = []; // {url, status, body} for every candidate tried, for debugging
-    function attempt(k){
-      if(k >= cands.length){
-        var e = new Error("timetable_not_found");
-        e.attempts = attempts;
-        return Promise.reject(e);
-      }
-      var url = cands[k];
-      return authedFetch(url).then(function(res){
-        if(!res.ok){
-          return res.text().then(function(txt){
-            attempts.push({url:url, status:res.status, body:(txt||"").slice(0,300)});
-            return attempt(k+1);
-          }).catch(function(){
-            attempts.push({url:url, status:res.status, body:"(no body)"});
-            return attempt(k+1);
-          });
-        }
-        return res.text().then(function(txt){
-          var data;
-          try{ data = JSON.parse(txt); }catch(e){
-            attempts.push({url:url, status:res.status, body:"(invalid JSON) " + txt.slice(0,200)});
-            return attempt(k+1);
-          }
-          var stops = extractTimetableStops(data);
-          if(!stops){
-            attempts.push({url:url, status:res.status, body:txt.slice(0,300)});
-            return attempt(k+1);
-          }
-          return stops;
-        });
-      }).catch(function(err){
-        attempts.push({url:url, status:"fetch_error", body:String(err && err.message || err)});
-        return attempt(k+1);
-      });
-    }
-    return attempt(0);
-  }
-  // Kicks off the timetable fetch once per train and caches the result
-  // (or the failure) on trainState so pollOne can just read it back.
-  function ensureTimetable(trainNo){
-    var st = trainState[trainNo];
-    if(st.timetableStations || st.timetableFetching || st.timetableFailed) return;
-    st.timetableFetching = true;
-    fetchTimetable(trainNo).then(function(stops){
-      st.timetableStations = stops;
-      st.timetableFetching = false;
-      log("車次 " + trainNo + "：時刻表載入成功，共 " + stops.length + " 站，之後可推算下一站。", "ok");
-    }).catch(function(err){
-      st.timetableFetching = false;
-      st.timetableFailed = true;
-      log("車次 " + trainNo + "：時刻表查詢失敗（" + err.message + "），光點將只在到站時跳動，無法平滑移動。", "err");
-      if(err.attempts && err.attempts.length){
-        try{
-          var esc = function(s){ return String(s).replace(/</g,"&lt;"); };
-          var lines = err.attempts.map(function(a){
-            return esc(a.url) + " → HTTP " + esc(a.status) + "：" + esc(a.body);
-          }).join("<br>");
-          log("車次 " + trainNo + " 每個時刻表端點的嘗試結果：<br><span style=\"word-break:break-all;color:#8fa0b5;\">" +
-              lines + "</span>", "err");
-        }catch(e){}
-      }
-    });
-  }
-  // Returns {id, arrivalTime} for the stop right after the train's current
-  // station in its own stop sequence, or null if that can't be worked out.
-  // Returns both the current stop and next stop's full records (so callers
-  // can get at departureTime/arrivalTime for schedule-based progress, not
-  // just the next station's id).
-  // The live board's reported StationID is NOT always "where the train is
-  // right now" -- confirmed from real-world testing: with TrainStationStatus
-  // available (v3 endpoint), 0 means 進站中 (still approaching -- StationID
-  // is the UPCOMING stop, not the current one), 1/2 mean 在站上/已離站
-  // (StationID genuinely is/was the current stop). Without that field (v2
-  // fallback), fall back to comparing now-vs-ScheduledArrivalTime: a
-  // scheduled arrival still in the future means the train hasn't actually
-  // reached that station yet either. Getting this wrong was making the dot
-  // sit a whole station ahead of the train's real position.
-  // Returns {curStop, nextStop, id, arrivalTime} using the resolved pair
-  // (curStop = station just departed/at; nextStop = the one being approached).
-  function resolveCurrentAndNext(trainNo, info){
-    var st = trainState[trainNo];
-    if(!st.timetableStations) return null;
-    var stops = st.timetableStations;
-    var idx = -1;
-    for(var i=0;i<stops.length;i++){ if(stops[i].id === info.stationId){ idx = i; break; } }
-    if(idx < 0) return null;
-
-    var arrived;
-    if(info.stationStatus === 1 || info.stationStatus === 2){
-      arrived = true;
-    } else if(info.stationStatus === 0){
-      arrived = false;
-    } else {
-      var schedMs = hmsToMs(info.scheduledArrival);
-      if(schedMs != null){
-        arrived = (Date.now() >= schedMs + (info.delay||0)*60000 - 60000); // 60s slack
-      } else {
-        arrived = true; // no evidence either way -- keep the old assumption
-      }
-    }
-
-    var curIdx = arrived ? idx : idx - 1;
-    var nextIdx = arrived ? idx + 1 : idx;
-    if(curIdx < 0 || nextIdx >= stops.length) return null;
-    return {curStop: stops[curIdx], nextStop: stops[nextIdx], id: stops[nextIdx].id, arrivalTime: stops[nextIdx].arrivalTime};
-  }
-
-  // Converts a TDX "HH:mm:ss" (or "HH:mm") time-of-day string to an epoch ms
-  // timestamp on today's date. Returns null if the string can't be parsed.
-  function hmsToMs(hms){
-    if(!hms) return null;
-    var m = String(hms).match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-    if(!m) return null;
-    var now = new Date();
-    var d = new Date(now.getFullYear(), now.getMonth(), now.getDate(),
-      parseInt(m[1],10), parseInt(m[2],10), m[3]?parseInt(m[3],10):0);
-    return d.getTime();
-  }
-
-  // Schedule-based progress window for the current station->next station leg:
-  // departure time at the current stop through arrival time at the next one,
-  // both nudged by the train's currently-reported delay. Progress through
-  // this window (clamped 0..1, recomputed fresh every animation frame from
-  // the wall clock) drives the curved-track position and mileage -- no
-  // speed estimate needed when real schedule times are available.
-  function computeScheduleWindow(curStop, nextStop, delayMin){
-    if(!curStop || !nextStop) return null;
-    var depRaw = hmsToMs(curStop.departureTime || curStop.arrivalTime);
-    var arrRaw = hmsToMs(nextStop.arrivalTime || nextStop.departureTime);
-    if(depRaw == null || arrRaw == null) return null;
-    if(arrRaw <= depRaw) arrRaw += 24*3600*1000; // this leg crosses midnight
-    var delayMs = (delayMin || 0) * 60000;
-    var depMs = depRaw + delayMs, arrMs = arrRaw + delayMs;
-    if(arrMs <= depMs) return null;
-    return {depMs: depMs, arrMs: arrMs};
   }
 
   function pollOne(trainNo, color){
@@ -1106,53 +524,17 @@
         return tb.localeCompare(ta);
       });
       var info = parseRow(rows[0]);
-      updateTrainCard(trainNo, info, color, null, false, false, rows[0], false);
+      updateTrainCard(trainNo, info, color, null);
 
-      var reportedStation = stationById[info.stationId];
-      if(!reportedStation){
-        log("車次 " + trainNo + "：目前站點座標查無資料（StationID=\"" + info.stationId + "\"）。", "err");
-        // debug aid: TDX's exact field names for this endpoint are not guaranteed,
-        // so surface the raw row once so the real keys can be read off and the
-        // parser fixed, without needing the browser devtools.
-        try{
-          log("車次 " + trainNo + " 原始資料欄位：" + Object.keys(rows[0]).join(", "), "err");
-          var raw = JSON.stringify(rows[0]);
-          log("車次 " + trainNo + " 原始 JSON：<br><span style=\"word-break:break-all;color:#8fa0b5;\">" +
-              raw.replace(/</g,"&lt;").slice(0,1500) + "</span>", "err");
-        }catch(e){}
+      var cur = stationById[info.stationId];
+      if(!cur){
+        log("車次 " + trainNo + "：目前站點座標查無資料（StationID=" + info.stationId + "）。", "err");
         return;
       }
-      ensureTimetable(trainNo);
-      var resolved = resolveCurrentAndNext(trainNo, info);
-      // cur = the station the train has actually reached/departed (not
-      // necessarily info.stationId -- see resolveCurrentAndNext above).
-      // Falls back to the raw reported station only when resolution isn't
-      // possible yet (timetable still loading, or station not on this run).
-      var cur = resolved ? (stationById[resolved.curStop.id] || reportedStation) : reportedStation;
-      var curName = resolved ? (stationById[resolved.curStop.id] ? stationById[resolved.curStop.id].name : null) : null;
-      var target = resolved ? (stationById[resolved.id] || null) : null;
-      var nextArrival = resolved ? resolved.arrivalTime : null;
-
-      trainState[trainNo].color = color;
-      updateDeadReckoning(trainNo, info, cur, target);
-
-      // Prefer curving the dot along the real track (+ computing mileage
-      // for the hazard-zone check) whenever we have both the line geometry
-      // and a usable schedule window; driveDeadReckoning() picks this up
-      // every animation frame. Falls back to the plain straight-line/speed
-      // glide above when either is missing (e.g. different lines meeting
-      // at a junction, or this leg's times didn't parse).
-      trainState[trainNo].scheduleWindow = null;
-      if(resolved && target && cur){
-        var seg = buildTrackSegment(resolved.curStop.id, resolved.id, cur, target);
-        var win = seg ? computeScheduleWindow(resolved.curStop, resolved.nextStop, info.delay) : null;
-        if(seg && win){
-          trainState[trainNo].scheduleWindow = {
-            depMs: win.depMs, arrMs: win.arrMs,
-            subCoords: seg.subCoords, kmCur: seg.kmCur, kmNext: seg.kmNext, lineName: seg.lineName
-          };
-        }
-      }
+      var target = stationById[info.nextStationId] || null;
+      var marker = ensureMarker(trainNo, color);
+      var from = marker.getLatLng();
+      var fromArr = (from.lat === 0 && from.lng === 0) ? [cur.lat, cur.lon] : [from.lat, from.lng];
 
       if(glideLines[trainNo]) map.removeLayer(glideLines[trainNo]);
       if(target){
@@ -1160,41 +542,20 @@
           color: color, weight: 2, opacity: .5, dashArray: "4,6"
         }).addTo(map);
       }
+      animateMarkerTo(marker, fromArr, [cur.lat, cur.lon], 900);
 
       trainState[trainNo].lastInfo = info;
       trainState[trainNo].lastSeen = Date.now();
-      trainState[trainNo].nextStationName = target ? target.name : null;
-      trainState[trainNo].nextArrivalTime = nextArrival;
-      updateTrainCard(trainNo, info, color, cur, false, false, rows[0], !!target, target, nextArrival);
+      updateTrainCard(trainNo, info, color, cur);
       log("車次 " + trainNo + " 更新：" + (cur.name||info.stationId) +
-          "，誤點 " + (info.delay||0) + " 分。" +
-          (target ? "（下一站：" + (target.name||resolved.id) + (nextArrival ? "，預計到站 " + nextArrival : "") + "）" : ""), "ok");
+          "，誤點 " + (info.delay||0) + " 分。", "ok");
     }).catch(function(err){
-      if(err.message === "no_live_data"){
-        log("車次 " + trainNo + " 目前查無即時資料（可能尚未發車、已抵達終點，或今天沒有這個班次）。", "err");
-        updateTrainCard(trainNo, null, color, null, false, true);
-      } else {
-        log("車次 " + trainNo + " 查詢失敗：" + err.message, "err");
-        updateTrainCard(trainNo, null, color, null, true);
-      }
+      log("車次 " + trainNo + " 查詢失敗：" + err.message, "err");
+      updateTrainCard(trainNo, null, color, null, true);
     });
   }
 
-  function debugDetailsHtml(trainNo, rawRow, hasTarget){
-    if(!rawRow) return "";
-    var raw = "";
-    try{ raw = JSON.stringify(rawRow, null, 1); }catch(e){ raw = String(rawRow); }
-    raw = raw.replace(/</g,"&lt;");
-    return '<details style="margin-top:6px;">' +
-      '<summary style="cursor:pointer;font-size:11px;color:var(--fg-dim);">原始資料／除錯（下一站：' +
-      (hasTarget ? '<span style="color:var(--ok)">已解析</span>' : '<span style="color:var(--err)">未知</span>') +
-      '）</summary>' +
-      '<pre style="white-space:pre-wrap;word-break:break-all;font-size:10px;color:#8fa0b5;' +
-      'background:#0c1118;border-radius:6px;padding:6px;margin-top:4px;max-height:160px;overflow:auto;">' +
-      raw + '</pre></details>';
-  }
-
-  function updateTrainCard(trainNo, info, color, stationObj, failed, noData, rawRow, hasTarget, target, nextArrival){
+  function updateTrainCard(trainNo, info, color, stationObj, failed){
     var el = $("card_" + trainNo);
     if(!el){
       el = document.createElement("div");
@@ -1204,13 +565,7 @@
       $("cards").appendChild(el);
     }
     if(failed){
-      el.innerHTML = '<div class="no">車次 '+trainNo+'</div><div class="st" style="color:var(--err)">查詢失敗，稍後重試中…</div>' +
-        debugDetailsHtml(trainNo, rawRow, hasTarget);
-      return;
-    }
-    if(noData){
-      el.innerHTML = '<div class="no">車次 '+trainNo+'</div><div class="st" style="color:var(--fg-dim)">目前查無即時資料（尚未發車／已到站／非今日班次）</div>' +
-        debugDetailsHtml(trainNo, rawRow, hasTarget);
+      el.innerHTML = '<div class="no">車次 '+trainNo+'</div><div class="st" style="color:var(--err)">查詢失敗，稍後重試中…</div>';
       return;
     }
     if(!info){
@@ -1219,31 +574,11 @@
     }
     var delayCls = (info.delay && info.delay > 0) ? "late" : "ok";
     var delayTxt = (info.delay && info.delay > 0) ? ("誤點 " + info.delay + " 分") : "準點";
-    var nextTxt = target ?
-      ("下一站：" + (target.name || "—") + (nextArrival ? "（預計 " + nextArrival + " 到站）" : "")) :
-      "下一站：推算中…";
-    var st = trainState[trainNo] || {};
-    var mileageTxt = (st.lastLineName && st.lastKm != null) ?
-      ('<div class="meta">所在路線：'+st.lastLineName+' ・ 軌道里程：K'+st.lastKm.toFixed(1)+'</div>') : "";
     el.innerHTML =
       '<div class="no"><span class="pulse" style="--c:'+color+'"></span>車次 '+trainNo+'</div>' +
-      '<div class="st">目前位置：'+ (stationObj && stationObj.name || info.stationName || info.stationId || "未知") +
+      '<div class="st">目前位置：'+ (info.stationName || stationObj && stationObj.name || info.stationId || "未知") +
       '<span class="delay '+delayCls+'">'+delayTxt+'</span></div>' +
-      '<div class="meta">'+nextTxt+'</div>' +
-      '<div class="meta">終點：'+(info.endingStationName||"—")+' ・ 更新時間：'+(info.updateTime||"—")+'</div>' +
-      mileageTxt +
-      debugDetailsHtml(trainNo, rawRow, hasTarget);
-    // applyHazardState (driven by the per-frame dead-reckoning loop, not
-    // this poll-driven redraw) owns the hazard banner itself; re-append it
-    // here immediately so it survives this innerHTML rewrite without
-    // waiting for the next animation frame to put it back.
-    if(st.activeHazard){
-      var banner = document.createElement("div");
-      banner.className = "hazard-banner";
-      banner.textContent = "【警告】已進入 " + st.activeHazard.id + " " + st.activeHazard.name +
-        "（" + st.activeHazard.riskLevel + "）・目前里程 K" + (st.lastKm != null ? st.lastKm.toFixed(1) : "—");
-      el.appendChild(banner);
-    }
+      '<div class="meta">終點：'+(info.endingStationName||"—")+' ・ 更新時間：'+(info.updateTime||"—")+'</div>';
   }
 
   // ---------- polling loop ----------
@@ -1254,25 +589,20 @@
     }).filter(Boolean);
   }
 
-  var didInitialFit = false; // only auto-center/zoom once; never fight the user's own pan/zoom afterward
-
   function pollAll(){
     var trains = activeTrains();
     trains.forEach(function(t){
       if(!trainState[t.no]) trainState[t.no] = {};
       pollOne(t.no, t.color);
     });
-    if(trains.length && !didInitialFit){
+    if(trains.length){
       var bounds = [];
       trains.forEach(function(t){
         if(trainState[t.no] && trainState[t.no].marker){
           bounds.push(trainState[t.no].marker.getLatLng());
         }
       });
-      if(bounds.length){
-        map.fitBounds(bounds, {padding:[60,60], maxZoom: 12});
-        didInitialFit = true;
-      }
+      if(bounds.length) map.fitBounds(bounds, {padding:[60,60], maxZoom: 12});
     }
   }
 
@@ -1289,36 +619,16 @@
     saveState();
     $("cardsSection").style.display = "block";
     $("cards").innerHTML = "";
-    // Markers/glide-lines live only on trainState[no].marker and
-    // glideLines[no] -- wiping trainState without removing them first
-    // orphaned them on the map, so stop+start left duplicate dots behind
-    // for the same train number every time.
-    Object.keys(trainState).forEach(function(no){
-      var st = trainState[no];
-      if(st && st.marker) map.removeLayer(st.marker);
-    });
-    Object.keys(glideLines).forEach(function(no){
-      map.removeLayer(glideLines[no]);
-      delete glideLines[no];
-    });
     trainState = {};
     liveEndpointWinner = {};
-    didInitialFit = false;
     running = true;
     $("startBtn").textContent = "停止追蹤";
     $("startBtn").classList.add("stop");
     log("開始追蹤，每 " + Math.round(POLL_MS/1000) + " 秒更新一次。");
 
     loadStations().then(function(){
-      return sleep(400); // stagger startup calls to avoid tripping TDX's rate limit
-    }).then(function(){
-      // best-effort: hazard-zone checks and curved-track interpolation are
-      // a bonus feature, so a failure here must not block tracking itself
-      return loadRailGeometry().catch(function(){});
-    }).then(function(){
       pollAll();
       pollTimer = setInterval(pollAll, POLL_MS);
-      startDeadReckoning();
     }).catch(function(){
       running = false;
       $("startBtn").textContent = "開始追蹤";
@@ -1330,7 +640,6 @@
     running = false;
     if(pollTimer) clearInterval(pollTimer);
     pollTimer = null;
-    stopDeadReckoning();
     $("startBtn").textContent = "開始追蹤";
     $("startBtn").classList.remove("stop");
     log("已停止追蹤。");
@@ -1338,17 +647,6 @@
 
   $("startBtn").addEventListener("click", function(){
     if(running) stop(); else start();
-  });
-
-  // Mobile browsers throttle/freeze timers for a backgrounded tab to save
-  // battery, so a 30s poll can silently stall for minutes while the phone
-  // is locked or another app is in front. Catch up immediately instead of
-  // waiting for the next scheduled tick whenever the page becomes visible
-  // again.
-  document.addEventListener("visibilitychange", function(){
-    if(!document.hidden && running){
-      pollAll();
-    }
   });
   $("clearBtn").addEventListener("click", function(){
     $("status").innerHTML = "";
