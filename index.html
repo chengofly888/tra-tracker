@@ -480,6 +480,24 @@
   }
 
   // ---------- live position polling ----------
+  // TDX wraps several of its rail endpoints in an envelope object
+  // ({UpdateTime, ..., TrainLiveBoards:[...]}) rather than returning a bare
+  // array, and the wrapper's array key varies by endpoint/version. Unwrap
+  // whichever shape comes back instead of assuming one.
+  function extractRows(data){
+    if(Array.isArray(data)) return data;
+    if(!data || typeof data !== "object") return [];
+    var wrapKeys = ["TrainLiveBoards","LiveBoards","TrainLiveBoard","LiveBoard","TrainLiveBoardList"];
+    for(var i=0;i<wrapKeys.length;i++){
+      if(Array.isArray(data[wrapKeys[i]])) return data[wrapKeys[i]];
+    }
+    // a handful of endpoints return one row as a bare object with no wrapper
+    if(data.TrainNo !== undefined || data.StationID !== undefined || data.TrainStationID !== undefined){
+      return [data];
+    }
+    return [];
+  }
+
   function tryLiveEndpoints(trainNo){
     var cands = liveCandidates(trainNo);
     var preferred = liveEndpointWinner[trainNo];
@@ -487,14 +505,21 @@
     if(preferred !== undefined){
       order = [preferred].concat(order.filter(function(i){return i!==preferred;}));
     }
+    var sawEmptyBoard = false; // endpoint answered fine, just no active train right now
     function attempt(k){
-      if(k >= order.length) return Promise.reject(new Error("no_endpoint_worked"));
+      if(k >= order.length){
+        var e = new Error(sawEmptyBoard ? "no_live_data" : "no_endpoint_worked");
+        return Promise.reject(e);
+      }
       var idx = order[k];
       return authedFetch(cands[idx]).then(function(res){
         if(!res.ok) return attempt(k+1);
         return res.json().then(function(data){
-          var rows = Array.isArray(data) ? data : (data ? [data] : []);
-          if(rows.length === 0) return attempt(k+1);
+          var rows = extractRows(data);
+          if(rows.length === 0){
+            if(data && typeof data === "object" && !Array.isArray(data)) sawEmptyBoard = true;
+            return attempt(k+1);
+          }
           liveEndpointWinner[trainNo] = idx;
           return rows;
         }).catch(function(){ return attempt(k+1); });
@@ -559,12 +584,17 @@
       log("車次 " + trainNo + " 更新：" + (cur.name||info.stationId) +
           "，誤點 " + (info.delay||0) + " 分。", "ok");
     }).catch(function(err){
-      log("車次 " + trainNo + " 查詢失敗：" + err.message, "err");
-      updateTrainCard(trainNo, null, color, null, true);
+      if(err.message === "no_live_data"){
+        log("車次 " + trainNo + " 目前查無即時資料（可能尚未發車、已抵達終點，或今天沒有這個班次）。", "err");
+        updateTrainCard(trainNo, null, color, null, false, true);
+      } else {
+        log("車次 " + trainNo + " 查詢失敗：" + err.message, "err");
+        updateTrainCard(trainNo, null, color, null, true);
+      }
     });
   }
 
-  function updateTrainCard(trainNo, info, color, stationObj, failed){
+  function updateTrainCard(trainNo, info, color, stationObj, failed, noData){
     var el = $("card_" + trainNo);
     if(!el){
       el = document.createElement("div");
@@ -575,6 +605,10 @@
     }
     if(failed){
       el.innerHTML = '<div class="no">車次 '+trainNo+'</div><div class="st" style="color:var(--err)">查詢失敗，稍後重試中…</div>';
+      return;
+    }
+    if(noData){
+      el.innerHTML = '<div class="no">車次 '+trainNo+'</div><div class="st" style="color:var(--fg-dim)">目前查無即時資料（尚未發車／已到站／非今日班次）</div>';
       return;
     }
     if(!info){
