@@ -1289,6 +1289,18 @@
     saveState();
     $("cardsSection").style.display = "block";
     $("cards").innerHTML = "";
+    // Markers/glide-lines live only on trainState[no].marker and
+    // glideLines[no] -- wiping trainState without removing them first
+    // orphaned them on the map, so stop+start left duplicate dots behind
+    // for the same train number every time.
+    Object.keys(trainState).forEach(function(no){
+      var st = trainState[no];
+      if(st && st.marker) map.removeLayer(st.marker);
+    });
+    Object.keys(glideLines).forEach(function(no){
+      map.removeLayer(glideLines[no]);
+      delete glideLines[no];
+    });
     trainState = {};
     liveEndpointWinner = {};
     didInitialFit = false;
